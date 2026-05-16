@@ -1,0 +1,5 @@
+outs:
+- md5: 8d78f22a54dff9f9418f09b252290739
+  size: 1431465728
+  hash: md5
+  path: user_logs.csv
