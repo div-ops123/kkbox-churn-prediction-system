@@ -3,3 +3,4 @@
 /user_logs.csv
 /train.csv
 /derived_labels_feb2017.csv
+/train_features.parquet

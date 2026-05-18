@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MLflow runtime artifacts
+mlflow.db
+mlflow-artifacts/
+
+# Claude Code local settings
+.claude/
+mlruns/
