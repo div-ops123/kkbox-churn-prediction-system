@@ -134,3 +134,100 @@ Class imbalance: 8.99% churn (87,330 churned / 883,630 retained). Handle with sc
 | Completion ratio (num_100/total songs) median | 0.79 — users mostly listen to full songs |
 | Median active log days (March) | 18 out of 31 days |
 | Transactions per user: median | 1, p99 = 3 — most users have sparse history |
+
+---
+
+## Infrastructure (Step 1)
+
+### Stack
+
+- **PostgreSQL 16** in Docker (`kkbox_postgres`, container port 5432, host port **5433**)
+- **MLflow 3.12.0** in Docker (`kkbox_mlflow`, port 5000), backed by Postgres for metadata and a named volume for artifacts
+- Both defined in `docker-compose.yml`; brought up with `docker compose up -d`
+
+### Why port 5433 (not 5432)
+
+A local Windows PostgreSQL installation occupies port 5432 on this machine. Docker maps the container's internal port 5432 to host port 5433 to avoid the conflict. All connection strings and defaults use 5433 accordingly (`.env`, `db/seed.py`, `src/feature_module.py`).
+
+### Database schema (`db/init.sql`)
+
+Runs automatically on first container start via `/docker-entrypoint-initdb.d/`. Contains DDL for:
+- **Source tables**: `transactions`, `user_logs`, `members`, `train_labels` — dates stored as INTEGER (YYYYMMDD) to match CSV format and stay compatible with DuckDB queries
+- **Prediction store**: `predictions` — one row per user per scoring day; UNIQUE index on `(msno, scoring_date)` prevents duplicate batch runs
+- **Label store**: `labels` — monthly churn outcomes; PRIMARY KEY `(msno, anchor_expiry_date)` enforces one label per user per cohort
+- **Monitoring store**: `monitoring_metrics` — written by all three monitoring tracks (data drift, model performance, pipeline health)
+- No indexes in `init.sql` — bulk-load performance: indexes built by `db/seed.py` AFTER `COPY` completes (3-5× faster than maintaining B-tree during load)
+
+### Seeding (`db/seed.py`)
+
+One-time CSV → Postgres loader. Key decisions:
+- `conn.autocommit = True` — avoids holding a multi-GB transaction open; each COPY commits immediately
+- `COPY FROM STDIN WITH (FORMAT CSV, HEADER TRUE, NULL '')` — `NULL ''` treats empty strings as NULL (needed for the ~65%-null `gender` column in members.csv)
+- Idempotent: checks `SELECT COUNT(*)` before each table; skips if rows already exist
+- `SET maintenance_work_mem = '512MB'` before index creation — more sort RAM → faster index builds
+- 12 indexes created after all tables are loaded
+
+### MLflow tracking URI
+
+`src/train.py` reads `MLFLOW_TRACKING_URI` from the environment, falling back to `sqlite:///mlflow.db` if not set. This means:
+- Without Docker → falls back to local `mlflow.db` (dev workflow unchanged)
+- With Docker running → `.env` sets `http://localhost:5000` → logs to the containerized MLflow server
+
+---
+
+## Feature Module Refactor (Step 2)
+
+### The problem this solves
+
+The original `src/features.py` was a flat script with inline DuckDB SQL. If the serving pipeline duplicated that SQL (even slightly differently), features computed at serving time could silently diverge from features computed at training time — the model would score on a different distribution than it was trained on.
+
+### Solution: `src/feature_module.py`
+
+A single callable `build_features()` that both training and serving import:
+
+```python
+build_features(
+    msno_list,      # list of user IDs
+    expire_dates,   # subscription expiry date per user
+    p99_secs,       # winsorization threshold — load from feature_config.json
+    data_source,    # "csv" (training) or "postgres" (serving)
+    data_dir,       # CSV directory, default data/
+    pg_conn_str,    # Postgres URI, required when data_source="postgres"
+) -> pd.DataFrame   # indexed by msno, columns = FEATURE_COLS
+```
+
+Also exports `FEATURE_COLS` (20 features) and `CAT_COLS` (5 categoricals) — single source of truth imported by both `features.py` and `train.py`.
+
+### Key design decisions
+
+**feature_cutoff_date computed internally, not passed by caller.**
+The caller passes `expire_date` (the subscription expiry). The function internally computes `feature_cutoff_dt = expire_date - 14 days`. This prevents the serving pipeline from accidentally passing today's date instead of the correct cutoff, which would silently include post-cutoff data (leakage).
+
+**p99_secs injected as a parameter, never recomputed.**
+`features.py` computes p99_secs once from the training distribution and saves it to `models/feature_config.json`. The serving pipeline loads that file and passes the frozen value to `build_features()`. Recomputing from the serving-time distribution would give a different threshold as listening patterns drift — silent feature skew.
+
+**Data source abstraction via DuckDB views.**
+`_register_sources()` creates views `v_transactions`, `v_user_logs`, `v_members` pointing at either CSV files or Postgres tables. All four feature-building functions (`_build_txn`, `_build_log`, `_build_member`, plus the final join) query these views — the SQL is identical for both data sources.
+
+**Postgres mode uses DuckDB's postgres extension.**
+`ATTACH '{pg_conn_str}' AS pg (TYPE POSTGRES, READ_ONLY)` — DuckDB runs the same analytical SQL against Postgres without pulling all rows into Python first. For the serving cohort (a few thousand users expiring in 13-15 days) this is efficient enough; for large backfills, consider batching.
+
+**`tenure_days` filter is per-user, not hardcoded.**
+Original: `WHERE registration_init_time <= 20170317` (hardcoded to training cohort max). Refactored: `WHERE ... <= c.feature_cutoff_dt` — correct for any future cohort without code changes.
+
+### How `src/features.py` changed
+
+Reduced to a thin training wrapper:
+1. Stage 1: anchor logic (training-specific — builds user cohort from `train.csv` + `transactions.csv`)
+2. Stage 2: compute p99_secs, save to `models/feature_config.json`
+3. Stage 3: call `build_features()` with the cohort's expire dates
+4. Stage 4: join `is_churn`/`has_anchor` metadata back in, export parquet
+
+The inline Stages 2-5 (txn, log, member feature SQL + join) were removed — that logic now lives exclusively in `feature_module.py`.
+
+### Verified output
+
+Running `python src/features.py` after the refactor produces identical null rates to the pre-refactor run:
+- Transaction features: 96.7% null (extract gap)
+- Log features: 98.2% null (March-only coverage)
+- Member features: 12.2% null (future reg dates)
