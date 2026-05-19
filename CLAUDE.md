@@ -231,3 +231,103 @@ Running `python src/features.py` after the refactor produces identical null rate
 - Transaction features: 96.7% null (extract gap)
 - Log features: 98.2% null (March-only coverage)
 - Member features: 12.2% null (future reg dates)
+
+---
+
+## Serving Pipeline & Score API (Steps 3 & 4)
+
+### Files added
+
+| File | Purpose |
+|---|---|
+| `src/config.py` | Frozen dataclasses (`PostgresConfig`, `MLflowConfig`, `ServingConfig`, `ApiConfig`) loaded from env vars. `POSTGRES_PASSWORD` has no default — fails fast if absent. |
+| `src/model_loader.py` | Factory + abstract loader. `make_model_loader(use_mlflow=True/False)` returns `MLflowModelLoader` or `PickleModelLoader`. Callers never instantiate directly. |
+| `src/risk_tier.py` | Strategy pattern. `make_tier_strategy(tier_config).assign(scores)` → `list["HIGH"\|"MED"\|"LOW"]`. Add new strategies as subclasses without touching the pipeline. |
+| `src/serve.py` | Prefect `@flow` with 8 `@task` functions. CLI: `python src/serve.py --date YYYY-MM-DD --no-mlflow`. |
+| `src/api/main.py` | FastAPI app factory + lifespan (pool lifecycle). |
+| `src/api/schemas.py` | Pydantic schemas: `PredictionRecord`, `CohortResponse`, `ErrorResponse`, `HealthResponse`. |
+| `src/api/exceptions.py` | Custom exceptions + all exception handlers registered in `create_app()`. |
+| `src/api/dependencies.py` | FastAPI `Depends()` providers for pool and repository. |
+| `src/api/repositories/base.py` | `AbstractPredictionRepository` — 3-method interface. |
+| `src/api/repositories/postgres.py` | `PostgresPredictionRepository` — owns all SQL; uses server-side cursor for cohort > 50K rows. |
+| `src/api/routers/score.py` | `GET /score/{user_id}` |
+| `src/api/routers/cohort.py` | `GET /cohort?date=YYYY-MM-DD` |
+| `models/risk_tiers_config.json` | Versioned tier thresholds: HIGH ≥ 0.5, MED [0.2, 0.5), LOW < 0.2. |
+
+### MLflow model alias — required before using `use_mlflow=True`
+
+`train.py` was previously run against the **local SQLite fallback** (`src/mlflow.db`), not the Docker container's MLflow server. The containerized MLflow has no model registered. To fix:
+
+```bash
+# 1. Rerun training against the container
+MLFLOW_TRACKING_URI=http://localhost:5000 uv run python src/train.py
+
+# 2. Set the "production" alias (serve.py loads by alias, not version number)
+uv run python -c "
+import mlflow
+mlflow.set_tracking_uri('http://localhost:5000')
+mlflow.MlflowClient().set_registered_model_alias('LightGBMChurnClassifier', 'production', '1')
+"
+```
+
+Until this is done, run the serving pipeline with `--no-mlflow` to use `models/lgbm_baseline.pkl` directly.
+
+`train.py` registers the model but **does not set any alias**. The alias must be set manually (or added to `train.py` via `client.set_registered_model_alias()` after `mlflow.register_model()`).
+
+### LightGBM Booster vs sklearn predict_proba
+
+`lgb.train()` returns a `lgb.Booster` with `.predict()` (returns probabilities directly, 1-D), not `.predict_proba()`. `mlflow.lightgbm.load_model()` also returns a `Booster`. The `score_cohort` task dispatches correctly:
+- If `hasattr(model, "predict_proba")` → sklearn wrapper, take `[:, 1]`
+- Else → `Booster.predict()` already returns churn probabilities
+
+### Serving pipeline design decisions
+
+**One `psycopg2.connect()` per task, not a shared pool.**
+Tasks run sequentially over up to 2 hours. A single long-lived connection would risk TCP timeout. Per-task connections (opened and closed in a `_pg_conn()` context manager) are safer and simpler.
+
+**Upsert is the write strategy.**
+`INSERT ... ON CONFLICT (msno, scoring_date) DO UPDATE SET ...` means re-running the pipeline on the same day is always safe. The unique index `idx_pred_msno_scoring` enforces this at the DB level.
+
+**Parquet write and health metrics are non-fatal.**
+The DB write (`write_predictions_postgres`) is the authoritative output. If Parquet write fails, the pipeline logs WARNING and continues — downstream marketing/CRM reads from Postgres, not the file. Health metrics failure sets `status="partial"` but never kills serving.
+
+**Empty cohort is not an error.**
+`len(cohort_df) == 0` triggers an early exit: one monitoring metric is written (`cohort_size=0, alert_triggered=True`), the flow returns `status="success"`. This prevents false failure alerts on days when no subscriptions expire in the 13–15-day window.
+
+**Retry configs are per-task, not global.**
+DB reads retry 3× (transient drops). MLflow loads retry 2× (network latency). Inference retries 0× (deterministic — a failure is a code bug, not transient). Parquet and metrics tasks retry but do not abort the flow on exhaustion.
+
+### Score API design decisions
+
+**Repository pattern isolates all SQL.**
+`AbstractPredictionRepository` defines exactly 3 methods (`get_latest_for_user`, `get_cohort_for_date`, `health_check`). Routers depend on the abstract class. In tests, override via `app.dependency_overrides[get_prediction_repository] = lambda: InMemoryRepo()` — no DB needed.
+
+**`ThreadedConnectionPool` created once in lifespan.**
+`psycopg2.pool.ThreadedConnectionPool(minconn, maxconn)` is created in the FastAPI `@asynccontextmanager lifespan` and stored on `app.state.pool`. `get_connection_pool()` retrieves it; it never creates a new pool. Pool is closed on shutdown via `pool.closeall()`.
+
+**`GET /cohort` returns 200 with empty list, never 404.**
+A date with no predictions is valid (the pipeline may not have run yet, or the cohort was empty). `{"scoring_date": "...", "count": 0, "predictions": []}` is the correct response. Only a missing/malformed `date` param returns 4xx.
+
+**Two-step date validation on `GET /cohort`.**
+`Query(pattern=r"^\d{4}-\d{2}-\d{2}$")` catches format errors → 422 (FastAPI). `date.fromisoformat()` catches semantic errors (e.g. `2026-13-99`) → 400 via the `ValueError` handler. This gives callers a meaningful distinction between "wrong format" and "invalid calendar date".
+
+**Uniform `ErrorResponse` envelope.**
+Every 4xx/5xx returns `{"error": "...", "message": "...", "field": null, "retry_after_seconds": null}`. No raw FastAPI/Pydantic error objects are ever exposed. All exception handlers are registered in `register_exception_handlers(app)` called once from `create_app()`.
+
+### Risk tier config design decisions
+
+`models/risk_tiers_config.json` is the versioned source of truth for thresholds. `load_risk_tiers_config()` validates at startup that the intervals are contiguous and cover [0.0, 1.0] with no gap or overlap — a misconfigured file fails fast before any task runs. The `FixedThresholdStrategy` iterates tiers in config order and assigns the first matching interval, so tier order matters (HIGH is checked first). Adding a new tier (e.g. CRITICAL) requires only: editing the JSON + adding `"CRITICAL"` to the DB `CHECK` constraint + adding `Literal["CRITICAL"]` to Pydantic schemas — zero changes to `serve.py`.
+
+### Start the API
+
+```bash
+# With Docker running (Postgres on port 5433):
+uv run uvicorn src.api.main:app --reload --port 8000
+
+# Smoke test:
+curl http://localhost:8000/health
+curl "http://localhost:8000/cohort?date=2017-03-01"
+curl "http://localhost:8000/score/<msno>"
+```
+
+OpenAPI docs auto-generated at `http://localhost:8000/docs`.
