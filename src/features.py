@@ -18,6 +18,7 @@ Notes:
   - has_anchor is metadata only — do not pass to LightGBM (always 1 at serving time)
 """
 
+import json
 import duckdb
 from pathlib import Path
 
@@ -129,6 +130,14 @@ p99_secs = con.execute(f"""
     FROM read_csv_auto('{DATA}/user_logs.csv')
 """).fetchone()[0]
 print(f"  total_secs p99 (post-86400 cap): {p99_secs:,.0f} s ({p99_secs/3600:.1f} hrs)")
+
+# Persist threshold so serving pipeline uses the same value computed here,
+# not a recomputed value from a potentially drifted distribution.
+_config_path = BASE_DIR / "models" / "feature_config.json"
+_config_path.parent.mkdir(exist_ok=True)
+with open(_config_path, "w") as _f:
+    json.dump({"p99_secs": float(p99_secs)}, _f, indent=2)
+print(f"  Saved feature_config.json → {_config_path}")
 
 con.execute(f"""
 CREATE OR REPLACE TABLE log_features AS

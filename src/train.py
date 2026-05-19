@@ -10,6 +10,7 @@ Run (from project root):
 """
 
 # %%
+import json
 import pickle
 import mlflow
 import mlflow.lightgbm
@@ -20,11 +21,11 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from pathlib import Path
 
 # %%
-BASE_DIR = Path(__file__).resolve().parent.parent
-
-PARQUET = BASE_DIR / "data" / "train_features.parquet"
-MODELS  = BASE_DIR / "models"
-TOP_K   = 100   # marketing budget constraint: contacts per campaign
+BASE_DIR      = Path(__file__).resolve().parent.parent
+PARQUET       = BASE_DIR / "data" / "train_features.parquet"
+MODELS        = BASE_DIR / "models"
+FEATURE_CFG   = MODELS / "feature_config.json"   # written by features.py
+TOP_K         = 100   # marketing budget constraint: contacts per campaign
 
 mlflow.set_tracking_uri(f"sqlite:///{BASE_DIR}/mlflow.db")
 mlflow.set_experiment("kkbox-churn-baseline")
@@ -35,6 +36,10 @@ df = pd.read_parquet(PARQUET)
 print(f"Loaded: {len(df):,} rows x {df.shape[1]} cols")
 print(f"Churn rate: {df['is_churn'].mean():.4%}  "
       f"({df['is_churn'].sum():,} churned / {(df['is_churn']==0).sum():,} retained)")
+
+with open(FEATURE_CFG) as _f:
+    feature_config = json.load(_f)
+print(f"Feature config loaded: p99_secs={feature_config['p99_secs']:,.0f}")
 # %%
 
 # ── 2. Null rate audit ────────────────────────────────────────────────────────
@@ -173,13 +178,15 @@ with mlflow.start_run(run_name="lgbm_baseline"):
 
     mlflow.log_params({
         **{k: v for k, v in params.items() if k != "verbosity"},
-        "features":   ",".join(FEATURE_COLS),
+        "features":     ",".join(FEATURE_COLS),
         "cat_features": ",".join(CAT_COLS),
-        "n_features": len(FEATURE_COLS),
-        "train_rows": len(X_train),
-        "val_rows":   len(X_val),
-        "top_k":      TOP_K,
+        "n_features":   len(FEATURE_COLS),
+        "train_rows":   len(X_train),
+        "val_rows":     len(X_val),
+        "top_k":        TOP_K,
+        "p99_secs":     feature_config["p99_secs"],
     })
+    mlflow.log_artifact(str(FEATURE_CFG), artifact_path="feature_config")
 
     model = lgb.train(
         params,
