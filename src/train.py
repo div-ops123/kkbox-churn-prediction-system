@@ -11,6 +11,7 @@ Run (from project root):
 
 # %%
 import json
+import os
 import pickle
 import mlflow
 import mlflow.lightgbm
@@ -27,7 +28,9 @@ MODELS        = BASE_DIR / "models"
 FEATURE_CFG   = MODELS / "feature_config.json"   # written by features.py
 TOP_K         = 100   # marketing budget constraint: contacts per campaign
 
-mlflow.set_tracking_uri(f"sqlite:///{BASE_DIR}/mlflow.db")
+mlflow.set_tracking_uri(
+    os.getenv("MLFLOW_TRACKING_URI", f"sqlite:///{BASE_DIR}/mlflow.db")
+)
 mlflow.set_experiment("kkbox-churn-baseline")
 
 # %%

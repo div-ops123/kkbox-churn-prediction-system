@@ -1,0 +1,39 @@
+services:
+
+  postgres:
+    image: postgres:16
+    container_name: kkbox_postgres
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-kkbox}
+      POSTGRES_USER:     ${POSTGRES_USER:-kkbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kkbox}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/10_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kkbox} -d ${POSTGRES_DB:-kkbox}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow.Dockerfile
+    container_name: kkbox_mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MLFLOW_BACKEND_STORE_URI:      postgresql://${POSTGRES_USER:-kkbox}:${POSTGRES_PASSWORD:-kkbox}@postgres:5432/${POSTGRES_DB:-kkbox}
+      MLFLOW_ARTIFACTS_DESTINATION:  /mlflow/artifacts
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+
+volumes:
+  postgres_data:
+  mlflow_artifacts:
