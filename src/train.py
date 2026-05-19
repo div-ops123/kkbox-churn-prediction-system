@@ -14,13 +14,19 @@ import json
 import os
 import pickle
 import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import mlflow
 import mlflow.lightgbm
+from mlflow import MlflowClient
 import pandas as pd
 import lightgbm as lgb
+from dotenv import load_dotenv
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score, roc_auc_score
 from pathlib import Path
+
+load_dotenv()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from feature_module import FEATURE_COLS, CAT_COLS
@@ -173,22 +179,14 @@ params = {
 print(f"\nscale_pos_weight = {scale_pos:.2f}  (retained:churned ratio)")
 print("Training LightGBM (early stopping on val AUC-PR)...\n")
 
+mlflow.lightgbm.autolog()
+
 ds_train = lgb.Dataset(X_train, label=y_train, categorical_feature=CAT_COLS, free_raw_data=False)
 ds_val   = lgb.Dataset(X_val,   label=y_val,   categorical_feature=CAT_COLS,
                         reference=ds_train,     free_raw_data=False)
 
 with mlflow.start_run(run_name="lgbm_baseline"):
 
-    mlflow.log_params({
-        **{k: v for k, v in params.items() if k != "verbosity"},
-        "features":     ",".join(FEATURE_COLS),
-        "cat_features": ",".join(CAT_COLS),
-        "n_features":   len(FEATURE_COLS),
-        "train_rows":   len(X_train),
-        "val_rows":     len(X_val),
-        "top_k":        TOP_K,
-        "p99_secs":     feature_config["p99_secs"],
-    })
     mlflow.log_artifact(str(FEATURE_CFG), artifact_path="feature_config")
 
     model = lgb.train(
@@ -248,17 +246,21 @@ with mlflow.start_run(run_name="lgbm_baseline"):
         pickle.dump(model, f)
     print(f"\nModel saved to {out}")
 
-    model_info = mlflow.lightgbm.log_model(model, name="lgbm_baseline", input_example=X_train)
-    print(f"MLflow run logged to mlflow.db  (run id: {mlflow.active_run().info.run_id})")
+    # print(f"MLflow run logged to mlflow.db  (run id: {mlflow.active_run().info.run_id})")
 
 # %%
-mv = mlflow.register_model(model_uri=model_info.model_uri, name="LightGBMChurnClassifier")
-model_name = mv.name
-model_version = mv.version
-
-model_uri = f"models:/{model_name}/{model_version}"
-
-print(f"Name: {model_name}")
-print(f"Version: {model_version}")
+model_uri = f"runs:/{mlflow.last_active_run().info.run_id}/model"
 print(model_uri)
+
+mv = mlflow.register_model(model_uri=model_uri, name="LightGBMChurnClassifier")
+
+
+# Initialize the MLflow client
+client = MlflowClient()
+
+# Set an alias for a specific model version
+client.set_registered_model_alias(
+    name=mv.name, alias="production", version=mv.version
+)
+
 # %%
