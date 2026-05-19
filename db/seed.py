@@ -27,7 +27,7 @@ DATA     = BASE_DIR / "data"
 
 CONN_PARAMS = {
     "host":     os.getenv("POSTGRES_HOST", "localhost"),
-    "port":     int(os.getenv("POSTGRES_PORT", 5432)),
+    "port":     int(os.getenv("POSTGRES_PORT", 5433)),
     "dbname":   os.getenv("POSTGRES_DB",   "kkbox"),
     "user":     os.getenv("POSTGRES_USER", "kkbox"),
     "password": os.getenv("POSTGRES_PASSWORD", "kkbox"),
@@ -77,7 +77,7 @@ INDEXES = [
      "CREATE INDEX IF NOT EXISTS idx_mon_pipeline ON monitoring_metrics(pipeline_type, run_date)"),
 ]
 
-SEP = "─" * 60
+SEP = "-" * 60
 
 
 def _copy_table(cur, table: str, csv_path: Path) -> int:
@@ -158,7 +158,7 @@ def main() -> None:
 
     cur.close()
     conn.close()
-    print(f"\nSeed complete.\n")
+    print("\nSeed complete.\n")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ Run (from project root):
 import json
 import os
 import pickle
+import sys
 import mlflow
 import mlflow.lightgbm
 import pandas as pd
@@ -20,6 +21,9 @@ import lightgbm as lgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score, roc_auc_score
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from feature_module import FEATURE_COLS, CAT_COLS
 
 # %%
 BASE_DIR      = Path(__file__).resolve().parent.parent
@@ -134,10 +138,6 @@ df.head()
 # ── 3. Feature matrix ─────────────────────────────────────────────────────────
 # has_anchor excluded: always 1 at serving time — spurious training artifact.
 # has_log_data excluded: redundant with log feature nulls (LightGBM sees NaN).
-
-FEATURE_COLS = [col for cols in FEATURE_GROUPS.values() for col in cols]
-CAT_COLS     = ["last_is_auto_renew", "last_is_cancel", "ever_cancelled",
-                "ever_promo", "registered_via"]
 
 X = df[FEATURE_COLS]
 y = df["is_churn"]
