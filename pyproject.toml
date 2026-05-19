@@ -15,4 +15,8 @@ dependencies = [
     "pandas>=2.2,<3",
     "pyarrow<24",
     "scikit-learn>=1.8.0",
+    "fastapi>=0.136.1",
+    "uvicorn[standard]>=0.47.0",
+    "prefect>=3.7.1",
+    "python-dotenv>=1.2.2",
 ]

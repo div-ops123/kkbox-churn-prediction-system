@@ -1,0 +1,10 @@
+{
+  "version": "1.0.0",
+  "model_version_ref": "LightGBMChurnClassifier/1",
+  "strategy": "fixed_threshold",
+  "tiers": [
+    { "name": "HIGH", "score_min": 0.5, "score_max": 1.0, "inclusive_min": true,  "inclusive_max": true  },
+    { "name": "MED",  "score_min": 0.2, "score_max": 0.5, "inclusive_min": true,  "inclusive_max": false },
+    { "name": "LOW",  "score_min": 0.0, "score_max": 0.2, "inclusive_min": true,  "inclusive_max": false }
+  ]
+}
