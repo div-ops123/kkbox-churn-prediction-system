@@ -1,28 +1,24 @@
 """
 Monthly labeling pipeline — Step 5.
 
-Identifies users whose subscription expired in a target cohort month, assigns
-is_churn labels, and writes results to the PostgreSQL labels table.
+Identifies users whose subscription expired in a target cohort month, derives
+is_churn labels from transaction renewal patterns, and writes results to the
+PostgreSQL labels table.
 
-Two label sources are supported:
-  train_csv    — join against the official KKBox train.csv / train_labels table
-                 (used for March 2017; KKBox generated labels with full April data)
-  transactions — derive labels by checking for renewal activity within 30 days
-                 of anchor_expiry_date (used for future cohorts)
+Labels are always derived from transactions: is_churn = 0 if the user has a
+valid (is_cancel=0) transaction within 30 days of their anchor_expiry_date.
 
 Run locally (single execution):
-    python src/label.py --cohort-month 2017-03 --label-source train_csv
+    python src/label.py --cohort-month 2017-03
 
 Run via Prefect:
-    prefect deployment run kkbox-labeling-pipeline/local \\
-        --param cohort_month=2017-03 --param label_source=train_csv
+    prefect deployment run kkbox-labeling-pipeline/local --param cohort_month=2017-03
 
 Parameters
 ----------
-cohort_month : str       — "YYYY-MM" target cohort (e.g. "2017-03")
-label_source : str       — "train_csv" | "transactions"
-data_source  : str       — "postgres" (default) | "csv" (dev/testing only)
-data_dir     : str       — relative path to CSV directory (default "data/")
+cohort_month : str  — "YYYY-MM" target cohort (e.g. "2017-03")
+data_source  : str  — "postgres" (default) | "csv" (dev/testing only)
+data_dir     : str  — relative path to CSV directory (default "data/")
 """
 
 from __future__ import annotations
@@ -38,11 +34,11 @@ import psycopg2
 import psycopg2.extras
 from prefect import flow, get_run_logger, task
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import LabelingConfig, load_labeling_config
-from label_module import LABEL_COLS, build_cohort, compute_labels
+from core.label_module import LABEL_COLS, build_cohort, compute_labels
 
 
 # ── Custom exceptions ─────────────────────────────────────────────────────────
@@ -96,13 +92,8 @@ def build_label_cohort(config: LabelingConfig) -> pd.DataFrame:
         raise CohortBuildError(f"build_cohort() failed for {config.cohort_month}: {exc}") from exc
 
     logger.info(
-        "build_label_cohort complete",
-        extra={
-            "cohort_month": config.cohort_month,
-            "cohort_size": len(cohort_df),
-            "label_source": config.label_source,
-            "data_source": config.data_source,
-        },
+        f"build_label_cohort complete | cohort_month={config.cohort_month}"
+        f" | cohort_size={len(cohort_df)} | data_source={config.data_source}"
     )
     return cohort_df
 
@@ -126,13 +117,8 @@ def compute_churn_labels(cohort_df: pd.DataFrame, config: LabelingConfig) -> pd.
     churn_rate = float(labels_df["is_churn"].dropna().mean()) if len(labels_df) > 0 else 0.0
 
     logger.info(
-        "compute_churn_labels complete",
-        extra={
-            "rows_labeled": len(labels_df),
-            "nan_is_churn": nan_count,
-            "churn_rate": round(churn_rate, 4),
-            "label_source": config.label_source,
-        },
+        f"compute_churn_labels complete | rows_labeled={len(labels_df)}"
+        f" | churn_rate={round(churn_rate, 4)}"
     )
     return labels_df
 
@@ -142,20 +128,14 @@ def write_labels_postgres(labels_df: pd.DataFrame, config: LabelingConfig) -> in
     """
     Upsert labels into the PostgreSQL labels table.
 
-    Drops rows with NaN is_churn before writing (possible for train_csv mode when
-    a cohort user is absent from the label source). Logs a warning if any are dropped.
-
     Uses ON CONFLICT (msno, anchor_expiry_date) DO UPDATE — safe to re-run.
     Batches of 5,000 rows. Returns total rows upserted.
     """
     logger = get_run_logger()
 
-    valid_df = labels_df.dropna(subset=["is_churn"])
-    dropped = len(labels_df) - len(valid_df)
-    if dropped > 0:
-        logger.warning(f"Dropping {dropped} rows with missing is_churn before write")
+    valid_df = labels_df
     if valid_df.empty:
-        logger.warning("No rows to write — labels_df has no valid is_churn values")
+        logger.warning("No rows to write — labels_df is empty")
         return 0
 
     sql = """
@@ -192,10 +172,7 @@ def write_labels_postgres(labels_df: pd.DataFrame, config: LabelingConfig) -> in
     except Exception as exc:
         raise LabelWriteError(f"Upsert to labels table failed: {exc}") from exc
 
-    logger.info(
-        "write_labels_postgres complete",
-        extra={"rows_upserted": total_written, "cohort_month": config.cohort_month},
-    )
+    logger.info(f"write_labels_postgres complete | rows_upserted={total_written} | cohort_month={config.cohort_month}")
     return total_written
 
 
@@ -208,18 +185,16 @@ def log_labeling_metrics(
     """
     Write pipeline health metrics to the monitoring_metrics table.
 
-    Alerts when: cohort_size < 100, churn_rate > 0.5, missing_label_rate > 0.05.
+    Alerts when: cohort_size < 100, churn_rate > 0.5.
     """
     logger = get_run_logger()
 
-    churn_rate = float(labels_df["is_churn"].dropna().mean()) if len(labels_df) > 0 else 0.0
-    missing_rate = float(labels_df["is_churn"].isna().mean()) if len(labels_df) > 0 else 0.0
+    churn_rate = float(labels_df["is_churn"].mean()) if len(labels_df) > 0 else 0.0
 
     metrics = [
-        ("cohort_size",         float(len(labels_df)),  len(labels_df) < 100),
-        ("labels_written",      float(rows_written),    False),
-        ("churn_rate",          churn_rate,             churn_rate > 0.5),
-        ("missing_label_rate",  missing_rate,           missing_rate > 0.05),
+        ("cohort_size",     float(len(labels_df)),  len(labels_df) < 100),
+        ("labels_written",  float(rows_written),    False),
+        ("churn_rate",      churn_rate,             churn_rate > 0.5),
     ]
 
     rows = [
@@ -243,10 +218,7 @@ def log_labeling_metrics(
     alerted = [name for name, _, alert in metrics if alert]
     if alerted:
         logger.warning(f"Labeling alerts triggered: {alerted}")
-    logger.info(
-        "log_labeling_metrics complete",
-        extra={"metrics_written": len(metrics), "alerts": alerted},
-    )
+    logger.info(f"log_labeling_metrics complete | metrics_written={len(metrics)} | alerts={alerted}")
 
 
 def _write_empty_cohort_metric(config: LabelingConfig) -> None:
@@ -278,7 +250,6 @@ def _write_empty_cohort_metric(config: LabelingConfig) -> None:
 )
 def run_labeling_pipeline(
     cohort_month: str,
-    label_source: str = "train_csv",
     data_source: str = "postgres",
     data_dir: str = "data/",
 ) -> dict:
@@ -288,7 +259,6 @@ def run_labeling_pipeline(
     Parameters
     ----------
     cohort_month : str  — "YYYY-MM" target cohort month.
-    label_source : str  — "train_csv" (default) or "transactions".
     data_source  : str  — "postgres" (default) or "csv" (dev only).
     data_dir     : str  — relative path to CSV directory.
 
@@ -300,15 +270,13 @@ def run_labeling_pipeline(
     logger = get_run_logger()
     config = load_labeling_config(
         cohort_month=cohort_month,
-        label_source=label_source,
         data_source=data_source,
         data_dir=data_dir,
     )
 
     logger.info(
-        "run_labeling_pipeline started | cohort_month=%s | label_source=%s | data_source=%s",
+        "run_labeling_pipeline started | cohort_month=%s | data_source=%s",
         cohort_month,
-        label_source,
         data_source,
     )
 
@@ -351,7 +319,11 @@ def run_labeling_pipeline(
         "churn_rate": round(churn_rate, 4),
         "status": status,
     }
-    logger.info("run_labeling_pipeline complete", extra=result)
+    logger.info(
+        f"run_labeling_pipeline complete | cohort_month={result['cohort_month']}"
+        f" | cohort_size={result['cohort_size']} | labels_written={result['labels_written']}"
+        f" | churn_rate={result['churn_rate']} | status={result['status']}"
+    )
     return result
 
 
@@ -365,12 +337,6 @@ if __name__ == "__main__":
         "--cohort-month",
         required=True,
         help="Target cohort month in YYYY-MM format (e.g. 2017-03).",
-    )
-    parser.add_argument(
-        "--label-source",
-        choices=["train_csv", "transactions"],
-        default="train_csv",
-        help="Label source: 'train_csv' (official) or 'transactions' (derived).",
     )
     parser.add_argument(
         "--data-source",
@@ -388,7 +354,6 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s — %(message)s")
     result = run_labeling_pipeline(
         cohort_month=args.cohort_month,
-        label_source=args.label_source,
         data_source=args.data_source,
         data_dir=args.data_dir,
     )

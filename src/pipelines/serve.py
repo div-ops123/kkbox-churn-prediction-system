@@ -35,8 +35,8 @@ import psycopg2
 import psycopg2.extras
 from prefect import flow, task, get_run_logger
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
     ServingConfig,
@@ -44,14 +44,14 @@ from config import (
     load_risk_tiers_config,
     load_serving_config,
 )
-from feature_module import FEATURE_COLS, build_features
-from model_loader import (
+from core.feature_module import FEATURE_COLS, build_features
+from core.model_loader import (
     ModelLoadError,
     ModelNotFoundError,
     ScoringModel,
     make_model_loader,
 )
-from risk_tier import TierAssignmentError, make_tier_strategy
+from core.risk_tier import TierAssignmentError, make_tier_strategy
 
 
 # ── Custom exceptions ─────────────────────────────────────────────────────────
@@ -136,15 +136,7 @@ def fetch_expiring_cohort(
     except Exception as exc:
         raise CohortQueryError(f"Cohort query failed: {exc}") from exc
 
-    logger.info(
-        "fetch_expiring_cohort complete",
-        extra={
-            "cohort_size": len(df),
-            "window_start": str(lo),
-            "window_end": str(hi),
-            "scoring_date": str(scoring_date),
-        },
-    )
+    logger.info(f"fetch_expiring_cohort complete | cohort_size={len(df)} | window={lo}..{hi} | scoring_date={scoring_date}")
     return df
 
 
@@ -180,14 +172,7 @@ def build_feature_matrix(
 
     null_rates = feature_df.isna().mean()
     overall_null = float(null_rates.mean())
-    logger.info(
-        "build_feature_matrix complete",
-        extra={
-            "rows": len(feature_df),
-            "overall_null_rate": round(overall_null, 4),
-            "scoring_date": str(feature_df.index.name),
-        },
-    )
+    logger.info(f"build_feature_matrix complete | rows={len(feature_df)} | null_rate={round(overall_null, 4)}")
     for col, rate in null_rates.items():
         logger.debug(f"null_rate {col}={rate:.4f}")
 
@@ -212,15 +197,7 @@ def load_production_model(
     )
     model = loader.load()
     version = loader.get_model_version()
-    logger.info(
-        "load_production_model complete",
-        extra={
-            "model_version": version,
-            "use_mlflow": use_mlflow,
-            "model_name": config.mlflow.model_name,
-            "alias": config.mlflow.model_alias,
-        },
-    )
+    logger.info(f"load_production_model complete | version={version} | use_mlflow={use_mlflow} | alias={config.mlflow.model_alias}")
     return model, version
 
 
@@ -252,15 +229,11 @@ def score_cohort(
         raise ScoringError("predict_proba returned values outside [0, 1]")
 
     logger.info(
-        "score_cohort complete",
-        extra={
-            "n_users": len(scores),
-            "score_min": round(float(scores.min()), 4),
-            "score_max": round(float(scores.max()), 4),
-            "score_mean": round(float(scores.mean()), 4),
-            "score_p50": round(float(np.percentile(scores, 50)), 4),
-            "score_p90": round(float(np.percentile(scores, 90)), 4),
-        },
+        f"score_cohort complete | n_users={len(scores)}"
+        f" | min={round(float(scores.min()), 4)} max={round(float(scores.max()), 4)}"
+        f" | mean={round(float(scores.mean()), 4)}"
+        f" | p50={round(float(np.percentile(scores, 50)), 4)}"
+        f" | p90={round(float(np.percentile(scores, 90)), 4)}"
     )
     return scores
 
@@ -277,7 +250,7 @@ def assign_risk_tiers(scores: np.ndarray, tier_config: dict) -> list[str]:
         pct = count / len(tiers) if tiers else 0.0
         logger.info(f"tier_distribution {name}: count={count} pct={pct:.3f}")
 
-    logger.info("assign_risk_tiers complete", extra=strategy.describe())
+    logger.info(f"assign_risk_tiers complete | strategy={strategy.describe()}")
     return tiers
 
 
@@ -336,10 +309,7 @@ def write_predictions_postgres(
     except Exception as exc:
         raise DatabaseWriteError(f"Upsert to predictions table failed: {exc}") from exc
 
-    logger.info(
-        "write_predictions_postgres complete",
-        extra={"rows_upserted": total_written, "scoring_date": str(scoring_date)},
-    )
+    logger.info(f"write_predictions_postgres complete | rows_upserted={total_written} | scoring_date={scoring_date}")
     return total_written
 
 
@@ -373,10 +343,7 @@ def write_predictions_parquet(
     except Exception as exc:
         raise ParquetWriteError(f"Failed to write Parquet to {out_path}: {exc}") from exc
 
-    logger.info(
-        "write_predictions_parquet complete",
-        extra={"path": str(out_path), "rows": len(out_df)},
-    )
+    logger.info(f"write_predictions_parquet complete | path={out_path} | rows={len(out_df)}")
     return out_path
 
 
@@ -446,10 +413,7 @@ def log_pipeline_health_metrics(
     alerted = [name for name, _, alert in metrics if alert]
     if alerted:
         logger.warning(f"Pipeline health alerts triggered: {alerted}")
-    logger.info(
-        "log_pipeline_health_metrics complete",
-        extra={"metrics_written": len(metrics), "alerts": alerted},
-    )
+    logger.info(f"log_pipeline_health_metrics complete | metrics_written={len(metrics)} | alerts={alerted}")
 
 
 def _write_zero_cohort_metric(scoring_date: date, config: ServingConfig) -> None:
@@ -577,7 +541,11 @@ def run_serving_pipeline(
         "parquet_path": parquet_path,
         "status": status,
     }
-    logger.info("run_serving_pipeline complete", extra=result)
+    logger.info(
+        f"run_serving_pipeline complete | scoring_date={result['scoring_date']}"
+        f" | cohort_size={result['cohort_size']} | rows_written={result['rows_written']}"
+        f" | model_version={result['model_version']} | status={result['status']}"
+    )
     return result
 
 
