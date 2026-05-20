@@ -1,0 +1,5 @@
+outs:
+- md5: 1ca7371ac59d59eb355373ce0615813f
+  size: 152364
+  hash: md5
+  path: predictions_2017-03-01.parquet

@@ -1,5 +1,7 @@
 # KKBox Churn Prediction
 
+> **Never add 'Co-Authored-By' to git commit messages**
+
 ## Python Coding Standards & SWE Principles
 
 1. Comments & Documentation
