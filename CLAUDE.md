@@ -38,11 +38,11 @@ Data is in data/:
 - transactions.csv
 - user_logs.csv
 - members.csv
-- train.csv (official labels — use as-is, do not regenerate)
+- train.csv (official labels — use as-is, do not regenerate during experimentation)
 
 Files are large → use DuckDB (do not load fully into memory).
 
-Goal: Build a churn prediction model using LightGBM. EDA and cleaning are complete; next step is feature engineering.
+Goal: Build a production churn prediction system.
 
 ## Churn Definition
 
@@ -333,3 +333,50 @@ curl "http://localhost:8000/score/user with spaces"
 ```
 
 OpenAPI docs auto-generated at `http://localhost:8000/docs`.
+
+---
+
+## Labeling Pipeline (Step 5)
+
+### Files added / modified
+
+| File | Change | Purpose |
+|---|---|---|
+| `src/config.py` | Modified | Added `LabelingConfig` dataclass + `load_labeling_config()` function |
+| `src/label_module.py` | New | Pure labeling domain logic — no Prefect, no psycopg2, no side effects |
+| `src/label.py` | New | Prefect `@flow` with 4 `@task` functions. CLI: `python src/label.py --cohort-month YYYY-MM` |
+
+### Design decisions
+
+**Two label sources, same cohort-build logic.**
+`label_source="train_csv"` — joins the cohort against the official train.csv / `pg.train_labels` table; required for March 2017 because our transactions.csv lacks April data (Error 3). `label_source="transactions"` — derives labels from renewal patterns in the 30-day window; used for future cohorts where the full window is observable.
+
+**`build_cohort()` in `label_module.py` is NOT `features.py` Stage 1.**
+`features.py` Stage 1 starts with all 970K train.csv users and computes per-user anchors (including the `has_anchor=0` fallback). `build_cohort()` starts from transactions and only returns users with a confirmed expiry in the target month (~40K for March 2017). The `labels` table only stores users with a verified `anchor_expiry_date`; users with `has_anchor=0` appear only in `train_labels`.
+
+**DuckDB source abstraction via `_register_txn_source()`.**
+Creates a `v_transactions` view pointing at either CSV files or `pg.transactions`. When `data_source="postgres"`, also attaches the DB as `pg` — making `pg.train_labels` accessible without a second attach call.
+
+**`renewal_window_days` injected as integer into f-string SQL, not as a bind parameter.**
+DuckDB's INTERVAL syntax (`INTERVAL '30 days'`) does not support bind parameters. The value is validated as a positive integer in `load_labeling_config()` before reaching the SQL, preventing injection.
+
+**NaN `is_churn` is possible only for `label_source="train_csv"`.**
+Users in the cohort (confirmed March expiry in transactions) who are absent from `train_labels` get `is_churn = NULL`. `write_labels_postgres` drops these rows before upserting and logs a WARNING; the `labels` table schema enforces `NOT NULL`.
+
+**Metrics alert thresholds:**
+- `cohort_size < 100` → alert (unexpectedly small cohort)
+- `churn_rate > 0.5` → alert (unexpectedly high churn rate)
+- `missing_label_rate > 0.05` → alert (>5% of cohort missing labels in train_csv mode)
+
+### Run the labeling pipeline
+
+```bash
+# March 2017 training cohort — use official KKBox labels from train_labels table:
+uv run python src/label.py --cohort-month 2017-03 --label-source train_csv
+
+# Future cohort — derive labels from transaction renewals:
+uv run python src/label.py --cohort-month 2017-04 --label-source transactions
+
+# Dev / no Postgres — read from CSV files (still needs Postgres for writing labels):
+uv run python src/label.py --cohort-month 2017-03 --label-source train_csv --data-source csv
+```

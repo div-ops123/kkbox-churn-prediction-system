@@ -1,12 +1,12 @@
 """
-Centralized configuration for the serving pipeline and Score API.
+Centralized configuration for the serving pipeline, Score API, and labeling pipeline.
 
 All values are read from environment variables. A .env file is supported
 for local development (loaded via python-dotenv if present).
 
 Usage
 -----
-    from config import load_serving_config, load_api_config
+    from config import load_serving_config, load_api_config, load_labeling_config
     cfg = load_serving_config()
     print(cfg.postgres.conn_str)
 """
@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -69,6 +71,20 @@ class ApiConfig:
     postgres: PostgresConfig
     pool_min_conn: int
     pool_max_conn: int
+    log_level: str
+
+
+@dataclass(frozen=True)
+class LabelingConfig:
+    postgres: PostgresConfig
+    cohort_month: str               # "YYYY-MM"
+    label_source: str               # "train_csv" | "transactions"
+    data_source: str                # "csv" | "postgres"
+    data_dir: Path
+    train_csv_path: Path
+    renewal_window_days: int
+    feature_cutoff_lag_days: int
+    labeled_date: date
     log_level: str
 
 
@@ -141,6 +157,60 @@ def load_feature_config(path: Path) -> dict[str, float]:
     if not isinstance(p99, (int, float)) or p99 <= 0:
         raise ValueError(f"p99_secs must be a positive number, got {p99!r}")
     return data
+
+
+def load_labeling_config(
+    cohort_month: str,
+    label_source: str = "train_csv",
+    data_source: str = "postgres",
+    data_dir: str = "data/",
+) -> LabelingConfig:
+    """
+    Read environment variables and return a frozen LabelingConfig.
+
+    Parameters
+    ----------
+    cohort_month : str  — "YYYY-MM" target cohort month (e.g. "2017-03")
+    label_source : str  — "train_csv" uses official train.csv / train_labels table;
+                          "transactions" derives labels from renewal patterns.
+    data_source  : str  — "postgres" reads from PostgreSQL via DuckDB extension;
+                          "csv" reads from CSV files (dev / testing only).
+    data_dir     : str  — relative path to the CSV directory.
+
+    Raises EnvironmentError if POSTGRES_PASSWORD is not set.
+    Raises ValueError for invalid cohort_month format or unknown source values.
+    """
+    if not re.match(r"^\d{4}-\d{2}$", cohort_month):
+        raise ValueError(f"cohort_month must be 'YYYY-MM', got {cohort_month!r}")
+    if label_source not in ("train_csv", "transactions"):
+        raise ValueError(
+            f"label_source must be 'train_csv' or 'transactions', got {label_source!r}"
+        )
+    if data_source not in ("csv", "postgres"):
+        raise ValueError(
+            f"data_source must be 'csv' or 'postgres', got {data_source!r}"
+        )
+
+    renewal_days = int(os.getenv("RENEWAL_WINDOW_DAYS", "30"))
+    if renewal_days <= 0:
+        raise ValueError(f"RENEWAL_WINDOW_DAYS must be positive, got {renewal_days}")
+    cutoff_lag = int(os.getenv("FEATURE_CUTOFF_LAG_DAYS", "14"))
+    if cutoff_lag <= 0:
+        raise ValueError(f"FEATURE_CUTOFF_LAG_DAYS must be positive, got {cutoff_lag}")
+
+    pg = _require_postgres()
+    return LabelingConfig(
+        postgres=pg,
+        cohort_month=cohort_month,
+        label_source=label_source,
+        data_source=data_source,
+        data_dir=BASE_DIR / data_dir,
+        train_csv_path=BASE_DIR / os.getenv("TRAIN_CSV_PATH", "data/train.csv"),
+        renewal_window_days=renewal_days,
+        feature_cutoff_lag_days=cutoff_lag,
+        labeled_date=date.today(),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+    )
 
 
 def load_risk_tiers_config(path: Path) -> dict:
