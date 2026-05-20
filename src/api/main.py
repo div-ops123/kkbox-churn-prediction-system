@@ -18,12 +18,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncGenerator
 
-import psycopg2.pool
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+# Must be before relative imports: they chain into dependencies.py which also
+# needs config.  parent.parent resolves to src/ where config.py lives.
+_src_dir = str(Path(__file__).resolve().parent.parent)
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from config import load_api_config
+from config import load_api_config  # noqa: E402
+
+import psycopg2.pool
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from .exceptions import register_exception_handlers
 from .routers import cohort, score
@@ -90,8 +95,7 @@ def create_app() -> FastAPI:
         summary="API liveness and database readiness probe",
         tags=["ops"],
     )
-    async def health(request: "Request") -> JSONResponse:  # noqa: F821
-        from fastapi import Request as _Request
+    async def health(request: Request) -> JSONResponse:
         pool = getattr(request.app.state, "pool", None)
         db_status = "unreachable"
         http_status = 503

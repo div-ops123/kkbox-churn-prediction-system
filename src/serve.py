@@ -502,8 +502,9 @@ def run_serving_pipeline(
     tier_config = load_risk_tiers_config(config.risk_tiers_config_path)
 
     logger.info(
-        "run_serving_pipeline started",
-        extra={"scoring_date": str(scoring_date), "use_mlflow": use_mlflow},
+        "run_serving_pipeline started | scoring_date=%s | use_mlflow=%s",
+        scoring_date,
+        use_mlflow,
     )
 
     # ── Step 1: Cohort ────────────────────────────────────────────────────────

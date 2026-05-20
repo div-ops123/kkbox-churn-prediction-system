@@ -14,7 +14,9 @@ from pathlib import Path
 import psycopg2.pool
 from fastapi import Request
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+_src_dir = str(Path(__file__).resolve().parent.parent)  # src/
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
 from config import ApiConfig, load_api_config
 
 from .repositories.base import AbstractPredictionRepository

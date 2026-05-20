@@ -1,5 +1,35 @@
 # KKBox Churn Prediction
 
+## Python Coding Standards & SWE Principles
+
+1. Comments & Documentation
+• Use # for single-line comments.
+• Use triple quotes for multi-line comments.
+• Use docstrings (Google style) for all public modules, classes, and functions.
+# This is a single-line comment
+"""
+This is a multi-line comment.
+It can span several lines.
+"""
+def enroll_student(student, course):
+"""Enroll a student in a course.
+Args:
+student (Student): The student to enroll.
+course (Course): The course to enroll in.
+Returns:
+bool: True if successful, False otherwise.
+"""
+pass
+
+2. Function & Method Design
+• Use verbs for function names.
+• One function, one job (single responsibility).
+• Prefer short functions (<20 lines).
+• Limit arguments (1-3 preferred).
+• Avoid flag arguments; split into separate functions instead.
+
+---
+
 ## Project Setup
 
 Data is in data/:
@@ -122,19 +152,6 @@ Class imbalance: 8.99% churn (87,330 churned / 883,630 retained). Handle with sc
 - These are legacy migration users with effectively lifetime plans
 - Not an error — legitimate long-term accounts; keep in history
 
-### Key Distributional Facts (for feature engineering reference)
-
-| Stat | Value |
-|---|---|
-| % of transactions with payment_plan_days = 30 | 85.11% — monthly plan dominates |
-| Most common plan_list_price | 149 NTD (41.54%), then 99 NTD (28.49%) |
-| is_auto_renew = 1 | 78.53% of transactions |
-| is_cancel = 1 | 2.46% of transactions |
-| Median user_log total_secs/day | 4,583 sec (~1.27 hrs) |
-| Completion ratio (num_100/total songs) median | 0.79 — users mostly listen to full songs |
-| Median active log days (March) | 18 out of 31 days |
-| Transactions per user: median | 1, p99 = 3 — most users have sparse history |
-
 ---
 
 ## Infrastructure (Step 1)
@@ -254,25 +271,6 @@ Running `python src/features.py` after the refactor produces identical null rate
 | `src/api/routers/cohort.py` | `GET /cohort?date=YYYY-MM-DD` |
 | `models/risk_tiers_config.json` | Versioned tier thresholds: HIGH ≥ 0.5, MED [0.2, 0.5), LOW < 0.2. |
 
-### MLflow model alias — required before using `use_mlflow=True`
-
-`train.py` was previously run against the **local SQLite fallback** (`src/mlflow.db`), not the Docker container's MLflow server. The containerized MLflow has no model registered. To fix:
-
-```bash
-# 1. Rerun training against the container
-MLFLOW_TRACKING_URI=http://localhost:5000 uv run python src/train.py
-
-# 2. Set the "production" alias (serve.py loads by alias, not version number)
-uv run python -c "
-import mlflow
-mlflow.set_tracking_uri('http://localhost:5000')
-mlflow.MlflowClient().set_registered_model_alias('LightGBMChurnClassifier', 'production', '1')
-"
-```
-
-Until this is done, run the serving pipeline with `--no-mlflow` to use `models/lgbm_baseline.pkl` directly.
-
-`train.py` registers the model but **does not set any alias**. The alias must be set manually (or added to `train.py` via `client.set_registered_model_alias()` after `mlflow.register_model()`).
 
 ### LightGBM Booster vs sklearn predict_proba
 
@@ -327,7 +325,9 @@ uv run uvicorn src.api.main:app --reload --port 8000
 # Smoke test:
 curl http://localhost:8000/health
 curl "http://localhost:8000/cohort?date=2017-03-01"
-curl "http://localhost:8000/score/<msno>"
+curl "http://localhost:8000/score/<msno>" # Zy4W5mkOlk8+qCMQD4K+MFH7LXuRi8tGeiaFBfCTu78=
+curl "http://localhost:8000/score/nonexistent_user"
+curl "http://localhost:8000/score/user with spaces"
 ```
 
 OpenAPI docs auto-generated at `http://localhost:8000/docs`.
