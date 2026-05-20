@@ -4,6 +4,10 @@ Core labeling logic for the KKBox churn labeling pipeline.
 Called by label.py (Prefect orchestration). Pure — no Prefect, no psycopg2,
 no side effects. Each public function opens and closes its own DuckDB connection.
 
+Labels are always derived from transaction renewal patterns: a user is labeled
+is_churn = 0 if they have at least one non-cancel transaction within 30 days
+of their anchor_expiry_date, and is_churn = 1 otherwise.
+
 Public API
 ----------
     build_cohort(config)               → pd.DataFrame [msno, anchor_expiry_date, feature_cutoff_date]
@@ -23,7 +27,7 @@ import pandas as pd
 from config import LabelingConfig
 
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 LABEL_COLS: list[str] = [
     "msno",
@@ -68,14 +72,11 @@ def build_cohort(config: LabelingConfig) -> pd.DataFrame:
 
 def compute_labels(cohort_df: pd.DataFrame, config: LabelingConfig) -> pd.DataFrame:
     """
-    Assign is_churn to each user in the cohort.
+    Assign is_churn to each user in the cohort using transaction renewal patterns.
 
-    label_source="train_csv"    — LEFT JOIN against the official train.csv / train_labels
-                                   Postgres table. Users absent from the source get
-                                   is_churn = NaN (dropped in write_labels_postgres).
-    label_source="transactions" — Derive from renewal patterns: is_churn = 1 if no
-                                   valid (is_cancel=0) transaction appears within
-                                   config.renewal_window_days after anchor_expiry_date.
+    A user is labeled is_churn = 0 if at least one valid (is_cancel=0) transaction
+    exists within config.renewal_window_days after their anchor_expiry_date.
+    All others are labeled is_churn = 1.
 
     Returns
     -------
@@ -98,10 +99,7 @@ def compute_labels(cohort_df: pd.DataFrame, config: LabelingConfig) -> pd.DataFr
             FROM _label_cohort_input
         """)
 
-        if config.label_source == "train_csv":
-            result_df = _label_from_train_csv(con, config)
-        else:
-            result_df = _label_from_transactions(con, config)
+        result_df = _label_from_transactions(con, config)
     finally:
         con.close()
 
@@ -124,8 +122,7 @@ def _month_bounds_int(cohort_month: str) -> tuple[int, int]:
 def _register_txn_source(con: duckdb.DuckDBPyConnection, config: LabelingConfig) -> None:
     """
     Create the v_transactions view pointing at either CSV files or PostgreSQL.
-    When data_source="postgres", also attaches the DB as 'pg' so that
-    pg.train_labels is accessible in subsequent queries.
+    When data_source="postgres", also attaches the DB as 'pg'.
     """
     if config.data_source == "csv":
         d = config.data_dir.as_posix()
@@ -164,37 +161,6 @@ def _fetch_anchor_expiries(
         GROUP BY msno
         """,
         [month_start_int, month_end_int],
-    ).df()
-
-
-def _label_from_train_csv(
-    con: duckdb.DuckDBPyConnection,
-    config: LabelingConfig,
-) -> pd.DataFrame:
-    """
-    Assign is_churn by joining the cohort against the official train labels.
-
-    When data_source="postgres": reads from pg.train_labels (already attached).
-    When data_source="csv":      reads from the train.csv file on disk.
-
-    Users in the cohort but absent from the label source get is_churn = NULL (NaN).
-    """
-    if config.data_source == "postgres":
-        label_source_sql = "SELECT msno, is_churn FROM pg.train_labels"
-    else:
-        train_path = config.train_csv_path.as_posix()
-        label_source_sql = f"SELECT msno, is_churn FROM read_csv_auto('{train_path}')"
-
-    return con.execute(
-        f"""
-        SELECT
-            c.msno,
-            c.anchor_expiry_date,
-            c.feature_cutoff_date,
-            t.is_churn
-        FROM label_cohort c
-        LEFT JOIN ({label_source_sql}) t ON c.msno = t.msno
-        """
     ).df()
 
 

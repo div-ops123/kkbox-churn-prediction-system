@@ -22,10 +22,10 @@ import duckdb
 import pandas as pd
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from feature_module import build_features
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from core.feature_module import build_features
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA     = BASE_DIR / "data"
 OUT      = DATA / "train_features.parquet"
 

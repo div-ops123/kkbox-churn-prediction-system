@@ -28,11 +28,11 @@ from pathlib import Path
 
 load_dotenv()
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from feature_module import FEATURE_COLS, CAT_COLS
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from core.feature_module import FEATURE_COLS, CAT_COLS
 
 # %%
-BASE_DIR      = Path(__file__).resolve().parent.parent
+BASE_DIR      = Path(__file__).resolve().parent.parent.parent
 PARQUET       = BASE_DIR / "data" / "train_features.parquet"
 MODELS        = BASE_DIR / "models"
 FEATURE_CFG   = MODELS / "feature_config.json"   # written by features.py

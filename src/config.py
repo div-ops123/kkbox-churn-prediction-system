@@ -1,12 +1,13 @@
 """
-Centralized configuration for the serving pipeline, Score API, and labeling pipeline.
+Centralized configuration for the serving pipeline, Score API, labeling pipeline,
+and training pipeline.
 
 All values are read from environment variables. A .env file is supported
 for local development (loaded via python-dotenv if present).
 
 Usage
 -----
-    from config import load_serving_config, load_api_config, load_labeling_config
+    from config import load_serving_config, load_api_config, load_labeling_config, load_training_config
     cfg = load_serving_config()
     print(cfg.postgres.conn_str)
 """
@@ -83,6 +84,20 @@ class LabelingConfig:
     renewal_window_days: int
     feature_cutoff_lag_days: int
     labeled_date: date
+    log_level: str
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    postgres: PostgresConfig
+    mlflow: MLflowConfig
+    data_source: str                # "csv" | "postgres"
+    data_dir: Path
+    feature_config_path: Path
+    cohort_months: tuple[str, ...]  # ("YYYY-MM", ...) or () for all available months
+    val_fraction: float
+    early_stopping_rounds: int
+    n_estimators: int
     log_level: str
 
 
@@ -201,6 +216,60 @@ def load_labeling_config(
         renewal_window_days=renewal_days,
         feature_cutoff_lag_days=cutoff_lag,
         labeled_date=date.today(),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+    )
+
+
+def load_training_config(
+    cohort_months: list[str] | None = None,
+    data_source: str = "postgres",
+    data_dir: str = "data/",
+) -> TrainingConfig:
+    """
+    Read environment variables and return a frozen TrainingConfig.
+
+    Parameters
+    ----------
+    cohort_months : list of "YYYY-MM" strings to train on, or None / [] to use
+                    all rows currently in the labels table.
+    data_source   : "postgres" (default) | "csv" (dev / testing only).
+    data_dir      : relative path to the CSV directory.
+
+    Raises EnvironmentError if POSTGRES_PASSWORD is not set.
+    Raises ValueError for invalid cohort_month entries or unknown data_source.
+    """
+    if data_source not in ("csv", "postgres"):
+        raise ValueError(
+            f"data_source must be 'csv' or 'postgres', got {data_source!r}"
+        )
+
+    months: tuple[str, ...] = ()
+    if cohort_months:
+        for m in cohort_months:
+            if not re.match(r"^\d{4}-\d{2}$", m):
+                raise ValueError(f"cohort_months entries must be 'YYYY-MM', got {m!r}")
+        months = tuple(cohort_months)
+
+    val_fraction = float(os.getenv("TRAINING_VAL_FRACTION", "0.2"))
+    if not (0.0 < val_fraction < 1.0):
+        raise ValueError(f"TRAINING_VAL_FRACTION must be in (0, 1), got {val_fraction}")
+
+    pg = _require_postgres()
+    mlflow_cfg = MLflowConfig(
+        tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
+        model_name=os.getenv("MLFLOW_MODEL_NAME", "LightGBMChurnClassifier"),
+        model_alias=os.getenv("MLFLOW_MODEL_ALIAS", "production"),
+    )
+    return TrainingConfig(
+        postgres=pg,
+        mlflow=mlflow_cfg,
+        data_source=data_source,
+        data_dir=BASE_DIR / data_dir,
+        feature_config_path=BASE_DIR / os.getenv("FEATURE_CONFIG_PATH", "models/feature_config.json"),
+        cohort_months=months,
+        val_fraction=val_fraction,
+        early_stopping_rounds=int(os.getenv("TRAINING_EARLY_STOPPING_ROUNDS", "50")),
+        n_estimators=int(os.getenv("TRAINING_N_ESTIMATORS", "1000")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
     )
 
