@@ -200,7 +200,7 @@ One-time CSV → Postgres loader. Key decisions:
 
 The original `src/features.py` was a flat script with inline DuckDB SQL. If the serving pipeline duplicated that SQL (even slightly differently), features computed at serving time could silently diverge from features computed at training time — the model would score on a different distribution than it was trained on.
 
-### Solution: `src/feature_module.py`
+### Solution: `src/core/feature_module.py`
 
 A single callable `build_features()` that both training and serving import:
 
@@ -234,7 +234,7 @@ The caller passes `expire_date` (the subscription expiry). The function internal
 **`tenure_days` filter is per-user, not hardcoded.**
 Original: `WHERE registration_init_time <= 20170317` (hardcoded to training cohort max). Refactored: `WHERE ... <= c.feature_cutoff_dt` — correct for any future cohort without code changes.
 
-### How `src/features.py` changed
+### How `src/training/features.py` changed
 
 Reduced to a thin training wrapper:
 1. Stage 1: anchor logic (training-specific — builds user cohort from `train.csv` + `transactions.csv`)
@@ -242,11 +242,11 @@ Reduced to a thin training wrapper:
 3. Stage 3: call `build_features()` with the cohort's expire dates
 4. Stage 4: join `is_churn`/`has_anchor` metadata back in, export parquet
 
-The inline Stages 2-5 (txn, log, member feature SQL + join) were removed — that logic now lives exclusively in `feature_module.py`.
+The inline Stages 2-5 (txn, log, member feature SQL + join) were removed — that logic now lives exclusively in `src/core/feature_module.py`.
 
 ### Verified output
 
-Running `python src/features.py` after the refactor produces identical null rates to the pre-refactor run:
+Running `python src/training/features.py` after the refactor produces identical null rates to the pre-refactor run:
 - Transaction features: 96.7% null (extract gap)
 - Log features: 98.2% null (March-only coverage)
 - Member features: 12.2% null (future reg dates)
@@ -260,9 +260,9 @@ Running `python src/features.py` after the refactor produces identical null rate
 | File | Purpose |
 |---|---|
 | `src/config.py` | Frozen dataclasses (`PostgresConfig`, `MLflowConfig`, `ServingConfig`, `ApiConfig`) loaded from env vars. `POSTGRES_PASSWORD` has no default — fails fast if absent. |
-| `src/model_loader.py` | Factory + abstract loader. `make_model_loader(use_mlflow=True/False)` returns `MLflowModelLoader` or `PickleModelLoader`. Callers never instantiate directly. |
-| `src/risk_tier.py` | Strategy pattern. `make_tier_strategy(tier_config).assign(scores)` → `list["HIGH"\|"MED"\|"LOW"]`. Add new strategies as subclasses without touching the pipeline. |
-| `src/serve.py` | Prefect `@flow` with 8 `@task` functions. CLI: `python src/serve.py --date YYYY-MM-DD --no-mlflow`. |
+| `src/core/model_loader.py` | Factory + abstract loader. `make_model_loader(use_mlflow=True/False)` returns `MLflowModelLoader` or `PickleModelLoader`. Callers never instantiate directly. |
+| `src/core/risk_tier.py` | Strategy pattern. `make_tier_strategy(tier_config).assign(scores)` → `list["HIGH"\|"MED"\|"LOW"]`. Add new strategies as subclasses without touching the pipeline. |
+| `src/pipelines/serve.py` | Prefect `@flow` with 8 `@task` functions. CLI: `python src/pipelines/serve.py --date YYYY-MM-DD --no-mlflow`. |
 | `src/api/main.py` | FastAPI app factory + lifespan (pool lifecycle). |
 | `src/api/schemas.py` | Pydantic schemas: `PredictionRecord`, `CohortResponse`, `ErrorResponse`, `HealthResponse`. |
 | `src/api/exceptions.py` | Custom exceptions + all exception handlers registered in `create_app()`. |
@@ -336,6 +336,28 @@ OpenAPI docs auto-generated at `http://localhost:8000/docs`.
 
 ---
 
+## src/ Layout (post Step 5 reorganization)
+
+```
+src/
+├── config.py          — shared infra config: PostgresConfig, ServingConfig, LabelingConfig, ApiConfig
+├── core/              — pure domain logic (no Prefect, no psycopg2, no side effects)
+│   ├── feature_module.py    build_features(), FEATURE_COLS, CAT_COLS
+│   ├── label_module.py      build_cohort(), compute_labels(), LABEL_COLS
+│   ├── model_loader.py      make_model_loader() factory
+│   └── risk_tier.py         make_tier_strategy() factory
+├── pipelines/         — Prefect @flow + @task, CLI entry points
+│   ├── label.py             monthly labeling pipeline
+│   └── serve.py             daily scoring pipeline
+├── training/          — one-off training scripts
+│   ├── features.py          build train_features.parquet
+│   └── train.py             train LightGBM baseline
+└── api/               — FastAPI Score API (unchanged)
+    └── ...
+```
+
+---
+
 ## Labeling Pipeline (Step 5)
 
 ### Files added / modified
@@ -343,40 +365,33 @@ OpenAPI docs auto-generated at `http://localhost:8000/docs`.
 | File | Change | Purpose |
 |---|---|---|
 | `src/config.py` | Modified | Added `LabelingConfig` dataclass + `load_labeling_config()` function |
-| `src/label_module.py` | New | Pure labeling domain logic — no Prefect, no psycopg2, no side effects |
-| `src/label.py` | New | Prefect `@flow` with 4 `@task` functions. CLI: `python src/label.py --cohort-month YYYY-MM` |
+| `src/core/label_module.py` | New | Pure labeling domain logic — no Prefect, no psycopg2, no side effects |
+| `src/pipelines/label.py` | New | Prefect `@flow` with 4 `@task` functions. CLI: `python src/pipelines/label.py --cohort-month YYYY-MM` |
 
 ### Design decisions
 
-**Two label sources, same cohort-build logic.**
-`label_source="train_csv"` — joins the cohort against the official train.csv / `pg.train_labels` table; required for March 2017 because our transactions.csv lacks April data (Error 3). `label_source="transactions"` — derives labels from renewal patterns in the 30-day window; used for future cohorts where the full window is observable.
+**Labels always derived from transactions — not from train.csv.**
+The labeling pipeline is a production component: after the model is deployed, future cohort labels come from transaction renewal patterns, not from KKBox. Reading train.csv labels belongs to `training/features.py` (training data prep only). The pipeline has no `label_source` switch; `compute_labels()` always calls `_label_from_transactions()`.
 
-**`build_cohort()` in `label_module.py` is NOT `features.py` Stage 1.**
+**`build_cohort()` in `core/label_module.py` is NOT `training/features.py` Stage 1.**
 `features.py` Stage 1 starts with all 970K train.csv users and computes per-user anchors (including the `has_anchor=0` fallback). `build_cohort()` starts from transactions and only returns users with a confirmed expiry in the target month (~40K for March 2017). The `labels` table only stores users with a verified `anchor_expiry_date`; users with `has_anchor=0` appear only in `train_labels`.
 
 **DuckDB source abstraction via `_register_txn_source()`.**
-Creates a `v_transactions` view pointing at either CSV files or `pg.transactions`. When `data_source="postgres"`, also attaches the DB as `pg` — making `pg.train_labels` accessible without a second attach call.
+Creates a `v_transactions` view pointing at either CSV files or `pg.transactions`. All labeling SQL is identical for both data sources.
 
 **`renewal_window_days` injected as integer into f-string SQL, not as a bind parameter.**
 DuckDB's INTERVAL syntax (`INTERVAL '30 days'`) does not support bind parameters. The value is validated as a positive integer in `load_labeling_config()` before reaching the SQL, preventing injection.
 
-**NaN `is_churn` is possible only for `label_source="train_csv"`.**
-Users in the cohort (confirmed March expiry in transactions) who are absent from `train_labels` get `is_churn = NULL`. `write_labels_postgres` drops these rows before upserting and logs a WARNING; the `labels` table schema enforces `NOT NULL`.
-
 **Metrics alert thresholds:**
 - `cohort_size < 100` → alert (unexpectedly small cohort)
-- `churn_rate > 0.5` → alert (unexpectedly high churn rate)
-- `missing_label_rate > 0.05` → alert (>5% of cohort missing labels in train_csv mode)
+- `churn_rate > 0.5` → alert (unusually high churn rate)
 
 ### Run the labeling pipeline
 
 ```bash
-# March 2017 training cohort — use official KKBox labels from train_labels table:
-uv run python src/label.py --cohort-month 2017-03 --label-source train_csv
-
 # Future cohort — derive labels from transaction renewals:
-uv run python src/label.py --cohort-month 2017-04 --label-source transactions
+uv run python src/pipelines/label.py --cohort-month 2017-04
 
 # Dev / no Postgres — read from CSV files (still needs Postgres for writing labels):
-uv run python src/label.py --cohort-month 2017-03 --label-source train_csv --data-source csv
+uv run python src/pipelines/label.py --cohort-month 2017-04 --data-source csv
 ```

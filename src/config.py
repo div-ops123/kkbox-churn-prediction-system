@@ -78,10 +78,8 @@ class ApiConfig:
 class LabelingConfig:
     postgres: PostgresConfig
     cohort_month: str               # "YYYY-MM"
-    label_source: str               # "train_csv" | "transactions"
     data_source: str                # "csv" | "postgres"
     data_dir: Path
-    train_csv_path: Path
     renewal_window_days: int
     feature_cutoff_lag_days: int
     labeled_date: date
@@ -161,31 +159,27 @@ def load_feature_config(path: Path) -> dict[str, float]:
 
 def load_labeling_config(
     cohort_month: str,
-    label_source: str = "train_csv",
     data_source: str = "postgres",
     data_dir: str = "data/",
 ) -> LabelingConfig:
     """
     Read environment variables and return a frozen LabelingConfig.
 
+    Labels are always derived from transaction renewal patterns. Use features.py
+    (training data prep) to read KKBox's official train.csv labels.
+
     Parameters
     ----------
     cohort_month : str  — "YYYY-MM" target cohort month (e.g. "2017-03")
-    label_source : str  — "train_csv" uses official train.csv / train_labels table;
-                          "transactions" derives labels from renewal patterns.
     data_source  : str  — "postgres" reads from PostgreSQL via DuckDB extension;
                           "csv" reads from CSV files (dev / testing only).
     data_dir     : str  — relative path to the CSV directory.
 
     Raises EnvironmentError if POSTGRES_PASSWORD is not set.
-    Raises ValueError for invalid cohort_month format or unknown source values.
+    Raises ValueError for invalid cohort_month format or unknown data_source.
     """
     if not re.match(r"^\d{4}-\d{2}$", cohort_month):
         raise ValueError(f"cohort_month must be 'YYYY-MM', got {cohort_month!r}")
-    if label_source not in ("train_csv", "transactions"):
-        raise ValueError(
-            f"label_source must be 'train_csv' or 'transactions', got {label_source!r}"
-        )
     if data_source not in ("csv", "postgres"):
         raise ValueError(
             f"data_source must be 'csv' or 'postgres', got {data_source!r}"
@@ -202,10 +196,8 @@ def load_labeling_config(
     return LabelingConfig(
         postgres=pg,
         cohort_month=cohort_month,
-        label_source=label_source,
         data_source=data_source,
         data_dir=BASE_DIR / data_dir,
-        train_csv_path=BASE_DIR / os.getenv("TRAIN_CSV_PATH", "data/train.csv"),
         renewal_window_days=renewal_days,
         feature_cutoff_lag_days=cutoff_lag,
         labeled_date=date.today(),
