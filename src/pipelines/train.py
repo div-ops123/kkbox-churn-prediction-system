@@ -179,6 +179,10 @@ def compute_p99_and_build_features(
     except Exception as exc:
         raise FeatureBuildError(f"build_features() failed: {exc}") from exc
 
+    config.baseline_features_path.parent.mkdir(parents=True, exist_ok=True)
+    features_df[FEATURE_COLS].to_parquet(config.baseline_features_path, index=True)
+    logger.info(f"baseline_features.parquet saved | rows={len(features_df)} | path={config.baseline_features_path}")
+
     cohort_meta = cohort_df.set_index("msno")[["is_churn"]].copy()
     cohort_meta["cohort_month"] = (
         pd.to_datetime(cohort_df.set_index("msno")["anchor_expiry_date"])

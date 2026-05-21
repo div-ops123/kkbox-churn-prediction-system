@@ -7,7 +7,7 @@ for local development (loaded via python-dotenv if present).
 
 Usage
 -----
-    from config import load_serving_config, load_api_config, load_labeling_config, load_training_config
+    from config import load_serving_config, load_api_config, load_labeling_config, load_training_config, load_monitoring_config
     cfg = load_serving_config()
     print(cfg.postgres.conn_str)
 """
@@ -94,10 +94,24 @@ class TrainingConfig:
     data_source: str                # "csv" | "postgres"
     data_dir: Path
     feature_config_path: Path
+    baseline_features_path: Path   # models/baseline_features.parquet
     cohort_months: tuple[str, ...]  # ("YYYY-MM", ...) or () for all available months
     val_fraction: float
     early_stopping_rounds: int
     n_estimators: int
+    log_level: str
+
+
+@dataclass(frozen=True)
+class MonitoringConfig:
+    postgres: PostgresConfig
+    data_source: str                # "csv" | "postgres"
+    data_dir: Path
+    feature_config_path: Path
+    baseline_features_path: Path   # models/baseline_features.parquet
+    psi_alert_threshold: float     # PSI > this triggers a data_drift alert
+    auc_pr_alert_threshold: float  # AUC-PR < this triggers a model_perf alert
+    top_k: int                     # Precision/Recall@K cutoff
     log_level: str
 
 
@@ -266,10 +280,67 @@ def load_training_config(
         data_source=data_source,
         data_dir=BASE_DIR / data_dir,
         feature_config_path=BASE_DIR / os.getenv("FEATURE_CONFIG_PATH", "models/feature_config.json"),
+        baseline_features_path=BASE_DIR / os.getenv("BASELINE_FEATURES_PATH", "models/baseline_features.parquet"),
         cohort_months=months,
         val_fraction=val_fraction,
         early_stopping_rounds=int(os.getenv("TRAINING_EARLY_STOPPING_ROUNDS", "50")),
         n_estimators=int(os.getenv("TRAINING_N_ESTIMATORS", "1000")),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+    )
+
+
+def load_monitoring_config(
+    data_source: str = "postgres",
+    data_dir: str = "data/",
+) -> MonitoringConfig:
+    """
+    Read environment variables and return a frozen MonitoringConfig.
+
+    Parameters
+    ----------
+    data_source : "postgres" (default) | "csv" (dev / testing only).
+    data_dir    : relative path to the CSV directory.
+
+    Raises EnvironmentError if POSTGRES_PASSWORD is not set.
+    Raises ValueError for invalid data_source or out-of-range thresholds.
+
+    Env vars
+    --------
+    BASELINE_FEATURES_PATH    default: models/baseline_features.parquet
+    MONITORING_PSI_THRESHOLD  default: 0.2
+    MONITORING_AUC_PR_THRESHOLD default: 0.45
+    MONITORING_TOP_K          default: 100
+    FEATURE_CONFIG_PATH       default: models/feature_config.json
+    """
+    if data_source not in ("csv", "postgres"):
+        raise ValueError(
+            f"data_source must be 'csv' or 'postgres', got {data_source!r}"
+        )
+
+    psi_threshold = float(os.getenv("MONITORING_PSI_THRESHOLD", "0.2"))
+    if psi_threshold <= 0:
+        raise ValueError(f"MONITORING_PSI_THRESHOLD must be positive, got {psi_threshold}")
+
+    auc_pr_threshold = float(os.getenv("MONITORING_AUC_PR_THRESHOLD", "0.45"))
+    if not (0.0 < auc_pr_threshold < 1.0):
+        raise ValueError(
+            f"MONITORING_AUC_PR_THRESHOLD must be in (0, 1), got {auc_pr_threshold}"
+        )
+
+    top_k = int(os.getenv("MONITORING_TOP_K", "100"))
+    if top_k <= 0:
+        raise ValueError(f"MONITORING_TOP_K must be positive, got {top_k}")
+
+    pg = _require_postgres()
+    return MonitoringConfig(
+        postgres=pg,
+        data_source=data_source,
+        data_dir=BASE_DIR / data_dir,
+        feature_config_path=BASE_DIR / os.getenv("FEATURE_CONFIG_PATH", "models/feature_config.json"),
+        baseline_features_path=BASE_DIR / os.getenv("BASELINE_FEATURES_PATH", "models/baseline_features.parquet"),
+        psi_alert_threshold=psi_threshold,
+        auc_pr_alert_threshold=auc_pr_threshold,
+        top_k=top_k,
         log_level=os.getenv("LOG_LEVEL", "INFO"),
     )
 

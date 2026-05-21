@@ -6,7 +6,7 @@ Output: models/lgbm_baseline.pkl
         mlflow.db                      (MLflow experiment log, project root)
 
 Run (from project root):
-    python src/train.py
+    python src/training/train.py
 """
 
 # %%
