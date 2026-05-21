@@ -224,3 +224,6 @@ mlflow-artifacts/
 # Claude Code local settings
 .claude/
 mlruns/
+
+# Personal drafts (not for public repo)
+blog_drafts.md

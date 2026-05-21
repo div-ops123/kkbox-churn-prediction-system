@@ -1,0 +1,17 @@
+apiVersion: 1
+
+datasources:
+  - name: KKBox Postgres
+    type: postgres
+    uid: kkbox_pg
+    url: kkbox_postgres:5432
+    database: kkbox
+    user: kkbox
+    secureJsonData:
+      password: $POSTGRES_PASSWORD
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+    isDefault: true
+    editable: false

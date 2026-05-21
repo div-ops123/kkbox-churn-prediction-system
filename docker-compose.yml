@@ -34,6 +34,25 @@ services:
     volumes:
       - mlflow_artifacts:/mlflow/artifacts
 
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: kkbox_grafana
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER:     admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+      POSTGRES_PASSWORD:          ${POSTGRES_PASSWORD:-kkbox}
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+
 volumes:
   postgres_data:
   mlflow_artifacts:
+  grafana_data:
