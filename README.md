@@ -206,18 +206,26 @@ All three tracks write to the same `monitoring_metrics` PostgreSQL table. Grafan
 
 ### Local Setup
 
-```bash
-# Prerequisites: Docker, Python 3.11+, uv
+### Prerequisites
 
-git clone <repo-url>
-cd kkbox-churn
+- Docker Desktop
+- Python 3.11+
+- [uv install](https://docs.astral.sh/uv/getting-started/installation/#installation-methods) (`pip install uv`) OPTIONAL
+
+
+```bash
+git clone https://github.com/div-ops123/kkbox-churn-prediction-system.git
+cd kkbox-churn-prediction-system
 cp .env.example .env   # set POSTGRES_PASSWORD=kkbox
 
 # Start infrastructure
 docker compose up -d
 
 # Install dependencies
+# Option 1
 uv sync
+# Option 2
+pip install -r requirements.txt
 
 # Seed database (one-time, ~5 min)
 uv run python db/seed.py

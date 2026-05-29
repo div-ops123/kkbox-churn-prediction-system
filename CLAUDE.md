@@ -1,35 +1,5 @@
 # KKBox Churn Prediction
 
-> **Never add 'Co-Authored-By' to git commit messages**
-
-## Python Coding Standards & SWE Principles
-
-1. Comments & Documentation
-• Use # for single-line comments.
-• Use triple quotes for multi-line comments.
-• Use docstrings (Google style) for all public modules, classes, and functions.
-# This is a single-line comment
-"""
-This is a multi-line comment.
-It can span several lines.
-"""
-def enroll_student(student, course):
-"""Enroll a student in a course.
-Args:
-student (Student): The student to enroll.
-course (Course): The course to enroll in.
-Returns:
-bool: True if successful, False otherwise.
-"""
-pass
-
-2. Function & Method Design
-• Use verbs for function names.
-• One function, one job (single responsibility).
-• Prefer short functions (<20 lines).
-• Limit arguments (1-3 preferred).
-• Avoid flag arguments; split into separate functions instead.
-
 ---
 
 ## Project Setup
