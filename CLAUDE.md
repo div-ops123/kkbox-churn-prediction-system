@@ -292,7 +292,7 @@ Every 4xx/5xx returns `{"error": "...", "message": "...", "field": null, "retry_
 
 ```bash
 # With Docker running (Postgres on port 5433):
-uv run uvicorn src.api.main:app --reload --port 8000
+uvicorn src.api.main:app --reload --port 8000
 
 # Smoke test:
 curl http://localhost:8000/health
@@ -360,8 +360,8 @@ DuckDB's INTERVAL syntax (`INTERVAL '30 days'`) does not support bind parameters
 
 ```bash
 # Future cohort — derive labels from transaction renewals:
-uv run python src/pipelines/label.py --cohort-month 2017-04
+python src/pipelines/label.py --cohort-month 2017-04
 
 # Dev / no Postgres — read from CSV files (still needs Postgres for writing labels):
-uv run python src/pipelines/label.py --cohort-month 2017-04 --data-source csv
+python src/pipelines/label.py --cohort-month 2017-04 --data-source csv
 ```

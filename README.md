@@ -136,17 +136,17 @@ The `p99_secs` winsorization threshold (43,805 sec/day) is computed once from th
 docker compose up -d     # PostgreSQL :5433, MLflow :5000, Grafana :3000
 
 # One-time seed
-uv run python db/seed.py
+python db/seed.py
 
 # Monthly pipeline cycle
-uv run python src/pipelines/label.py --cohort-month 2017-03
-uv run python src/pipelines/train.py --cohort-months 2017-03
-uv run python src/pipelines/serve.py --date 2017-03-01
-uv run python src/pipelines/monitor.py drift --date 2017-03-01
-uv run python src/pipelines/monitor.py performance --cohort-month 2017-03
+python src/pipelines/label.py --cohort-month 2017-03
+python src/pipelines/train.py --cohort-months 2017-03
+python src/pipelines/serve.py --date 2017-03-01
+python src/pipelines/monitor.py drift --date 2017-03-01
+python src/pipelines/monitor.py performance --cohort-month 2017-03
 
 # Score API
-uv run uvicorn src.api.main:app --reload --port 8000
+uvicorn src.api.main:app --reload --port 8000
 ```
 
 ### Monitoring Strategy
@@ -228,17 +228,17 @@ uv sync
 pip install -r requirements.txt
 
 # Seed database (one-time, ~5 min)
-uv run python db/seed.py
+python db/seed.py
 
 # Run full pipeline cycle
-uv run python src/pipelines/label.py --cohort-month 2017-03
-uv run python src/pipelines/train.py --cohort-months 2017-03
-uv run python src/pipelines/serve.py --date 2017-03-01
-uv run python src/pipelines/monitor.py drift --date 2017-03-01
-uv run python src/pipelines/monitor.py performance --cohort-month 2017-03
+python src/pipelines/label.py --cohort-month 2017-03
+python src/pipelines/train.py --cohort-months 2017-03
+python src/pipelines/serve.py --date 2017-03-01
+python src/pipelines/monitor.py drift --date 2017-03-01
+python src/pipelines/monitor.py performance --cohort-month 2017-03
 
 # Start Score API
-uv run uvicorn src.api.main:app --reload --port 8000
+uvicorn src.api.main:app --reload --port 8000
 ```
 
 ### Endpoints
