@@ -1,7 +1,7 @@
 """
 Shared feature computation module.
 
-Called by both training (features.py) and serving (serve.py).
+Called by both experiments/build_training_set.py and serving (serve.py).
 
 Accepts a list of users and their subscription expiry dates; returns a feature
 DataFrame. The 14-day pre-expiry cutoff is enforced INTERNALLY — callers must

@@ -194,8 +194,9 @@ def load_labeling_config(
     """
     Read environment variables and return a frozen LabelingConfig.
 
-    Labels are always derived from transaction renewal patterns. Use features.py
-    (training data prep) to read KKBox's official train.csv labels.
+    Labels are always derived from transaction renewal patterns. Use
+    experiments/build_training_set.py (training data prep) to read KKBox's
+    official train.csv labels.
 
     Parameters
     ----------

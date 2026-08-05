@@ -1,12 +1,12 @@
 """
 LightGBM churn prediction — baseline model.
 
-Input:  data/train_features.parquet   (produced by src/features.py)
+Input:  data/train_features.parquet   (produced by src/experiments/build_training_set.py)
 Output: models/lgbm_baseline.pkl
         mlflow.db                      (MLflow experiment log, project root)
 
 Run (from project root):
-    python src/training/train.py
+    python src/experiments/train_baseline.py
 """
 
 # %%
@@ -35,7 +35,7 @@ from core.feature_module import FEATURE_COLS, CAT_COLS
 BASE_DIR      = Path(__file__).resolve().parent.parent.parent
 PARQUET       = BASE_DIR / "data" / "train_features.parquet"
 MODELS        = BASE_DIR / "models"
-FEATURE_CFG   = MODELS / "feature_config.json"   # written by features.py
+FEATURE_CFG   = MODELS / "feature_config.json"   # written by build_training_set.py
 TOP_K         = 100   # marketing budget constraint: contacts per campaign
 
 mlflow.set_tracking_uri(
@@ -59,39 +59,48 @@ print(f"Feature config loaded: p99_secs={feature_config['p99_secs']:,.0f}")
 #
 # WHY WE DO NOT IMPUTE NULLS
 # --------------------------
-# In a production setting, KKBox would supply full transaction history and
-# rolling user logs, so the ~97-98% null rates seen here would not exist.
-# These nulls are artifacts of the Kaggle dataset extract, not genuine
-# missing values at inference time:
+# Training is anchored-only now (see experiments/build_training_set.py): every
+# row here is a user with a verified March-2017 expiry. That changes *why*
+# each feature group is null relative to the old full-cohort baseline — these
+# are the current, measured rates on the anchored cohort:
 #
-#   CAUSE A  extract gap — transaction features (~96.7% null)
-#     The transactions.csv extract covers only ~40K of the 970K train users.
-#     In production, every user has a transaction history.
-#     => Imputing 0 would wrongly encode "zero activity" for users who actually
-#        have full, rich histories. LightGBM's NaN routing learns that NULL here
-#        signals "data not present in extract" — a dataset artifact, not a signal.
+#   CAUSE A  cutoff timing — transaction features (~65.4% null)
+#     Every anchored user has at least one transaction row by construction
+#     (that's how they were selected) — this is NOT an extract-coverage gap.
+#     _build_txn only counts transactions strictly before feature_cutoff_dt
+#     (expire_dt - 14 days). Many anchored users' only visible transaction is
+#     the very renewal that created their March anchor, dated on/after that
+#     cutoff — so nothing qualifies as "prior history" in the window.
+#     => Imputing 0 would wrongly encode "zero activity" for users whose real
+#        history simply hasn't happened yet as of the 14-day-early cutoff.
+#        LightGBM's NaN routing learns that NULL here means "no qualifying
+#        transaction before cutoff" — a real feature-cutoff mechanic, not a
+#        dataset artifact, but still not equivalent to "zero engagement."
 #
-#   CAUSE B  log coverage gap — engagement features (~98.2% null)
-#     user_logs.csv only covers March 1-31, 2017. Most feature cutoffs fall
-#     before March 1, so no log data falls inside those windows.
+#   CAUSE B  log coverage gap — engagement features (~52.3% null)
+#     user_logs.csv only covers March 1-31, 2017. Anchored users whose
+#     feature_cutoff_dt falls before March 1 (i.e. expiring before ~March 15)
+#     have no log data in that window at all.
 #     In production, rolling 30/60/90-day logs would be available.
 #     => Same reasoning: absence of data in this extract ≠ zero listening.
 #
-#   CAUSE C  legitimate data quality — member features (~11.4% null)
-#     ~55K members.csv rows have registration_init_time > 20170317 (future
-#     dates). These are excluded from tenure_days per EDA decisions.
+#   CAUSE C  legitimate data quality — member features (~12.7% null)
+#     Some members.csv rows have a registration_init_time later than the
+#     user's own feature_cutoff_dt (future/invalid dates). These are excluded
+#     from tenure_days per EDA decisions (Error 4, docs/dataset_overview.md).
 #     => This IS a genuine data quality issue that could persist in production.
 #        Still no imputation: LightGBM will learn the null pattern if it
 #        correlates with churn; imputing the mean would destroy that signal.
 #
 # The goal of this project is to demonstrate model-building judgment and
 # awareness of dataset limitations. The high null rates do not invalidate
-# the model — they are fully expected given the extract, and LightGBM's
-# native NaN handling is the correct approach for all three causes.
+# the model — they are fully expected given the extract and the 14-day
+# cutoff rule, and LightGBM's native NaN handling is the correct approach
+# for all three causes.
 
 # %%
 FEATURE_GROUPS = {
-    "transaction  [CAUSE A — extract gap, ~96.7% null]": [
+    "transaction  [CAUSE A — cutoff timing, ~65.4% null]": [
         "n_txn",
         "n_cancel",
         "ever_cancelled",
@@ -105,7 +114,7 @@ FEATURE_GROUPS = {
         "cancel_rate",
         "days_since_last_txn",
     ],
-    "engagement-log  [CAUSE B — March-only coverage, ~98.2% null]": [
+    "engagement-log  [CAUSE B — March-only coverage, ~52.3% null]": [
         "log_days",
         "avg_daily_secs",
         "total_secs_sum",
@@ -113,7 +122,7 @@ FEATURE_GROUPS = {
         "avg_daily_unq_songs",
         "days_since_last_log",
     ],
-    "member  [CAUSE C — invalid reg dates, ~11.4% null]": [
+    "member  [CAUSE C — invalid reg dates, ~12.7% null]": [
         "registered_via",
         "tenure_days",
     ],
@@ -141,7 +150,7 @@ df.head()
 # %%
 # ── 3. Feature matrix ─────────────────────────────────────────────────────────
 # has_log_data excluded: redundant with log feature nulls (LightGBM sees NaN).
-# (has_anchor no longer exists — training is anchored-only now, see features.py)
+# (has_anchor no longer exists — training is anchored-only now, see build_training_set.py)
 
 X = df[FEATURE_COLS]
 y = df["is_churn"]
@@ -250,15 +259,16 @@ with mlflow.start_run(run_name="lgbm_baseline"):
 model_uri = f"runs:/{mlflow.last_active_run().info.run_id}/model"
 print(model_uri)
 
-mv = mlflow.register_model(model_uri=model_uri, name="LightGBMChurnClassifier")
+# === only register after confirmation model metrics is good
+# mv = mlflow.register_model(model_uri=model_uri, name="LightGBMChurnClassifier")
 
 
-# Initialize the MLflow client
-client = MlflowClient()
+# # Initialize the MLflow client
+# client = MlflowClient()
 
-# Set an alias for a specific model version
-client.set_registered_model_alias(
-    name=mv.name, alias="production", version=mv.version
-)
+# # Set an alias for a specific model version
+# client.set_registered_model_alias(
+#     name=mv.name, alias="production", version=mv.version
+# )
 
 # %%

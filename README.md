@@ -281,9 +281,9 @@ src/
 │   ├── train.py            — monthly training + model promotion
 │   ├── serve.py            — daily scoring pipeline
 │   └── monitor.py          — drift + performance + health monitoring
-├── training/               — one-off training scripts (experimentation)
-│   ├── features.py         — build train_features.parquet
-│   └── train.py            — train LightGBM baseline
+├── experiments/            — one-off baseline scripts (not the production path)
+│   ├── build_training_set.py — cohort selection + label join, writes train_features.parquet
+│   └── train_baseline.py     — train LightGBM baseline
 └── api/                    — FastAPI Score API
     ├── main.py
     ├── schemas.py

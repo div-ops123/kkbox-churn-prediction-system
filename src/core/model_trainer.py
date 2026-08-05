@@ -251,7 +251,7 @@ def evaluate_on_holdout(
 # ── Private helpers ────────────────────────────────────────────────────────────
 
 def _lgbm_params(scale_pos_weight: float, seed: int) -> dict:
-    """Fixed LightGBM training params — mirrors the baseline in training/train.py."""
+    """Fixed LightGBM training params — mirrors the baseline in experiments/train_baseline.py."""
     return {
         "objective":         "binary",
         "metric":            "average_precision",
