@@ -1,7 +1,7 @@
 """
 Shows the actual date-related problems in the raw KKBox data, with real
 example rows, so they can be seen directly instead of taken on faith from
-CLAUDE.md / docs/dataset_limitations.md.
+docs/dataset_overview.md.
 
 DuckDB over read_csv_auto - data too large to load fully into memory.
 """
