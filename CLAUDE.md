@@ -28,6 +28,14 @@ So for each user:
 Label cohort: March 2017 (users whose subscription expired in March 2017).
 Feature cutoff per user: anchor_expiry_dt - 14 days → ranges Feb 15 to March 17.
 
+**Confirmed empirically which Kaggle round this data is (see `explore/date_issues_check.py` Cell 7):**
+The KKBox competition had two rounds with different train cohorts — round 1 (train = users
+expiring Feb 2017, evaluated by March) and round 2/`_v2` (train = users expiring March 2017,
+evaluated by April). This project's `train.csv` (970,960 rows) matches round 2: 99.4% of
+users with an identifiable March-2017 expiry are in `train.csv`, vs 7% for Feb-2017 (350
+users total in the whole extract, only 25 in train.csv). Do not use the round-1 framing —
+it's easy to find in the competition's original overview text but does not describe this data.
+
 ---
 
 ## EDA Findings
@@ -79,23 +87,24 @@ Class imbalance: 8.99% churn (87,330 churned / 883,630 retained). Handle with sc
 - These are early KKBox system migration entries — plan metadata was not captured
 - Action: flag as is_legacy_record = 1; exclude from plan-price and plan-days features but keep in transaction history counts
 
-**Error 2 — membership_expire_date < transaction_date (5,106 rows):**
-- Logically impossible: subscription expires before the transaction that created it
-- Likely backdated cancellation records
-- Action: exclude from anchor_expiry_dt calculation and feature_cutoff derivation; flag as is_bad_expiry = 1
-
-**Error 3 — Cannot observe the full renewal window for the March 2017 cohort:**
+**Error 2 — Cannot observe the full renewal window for the March 2017 cohort:**
 - The 30-day renewal window for March expirations extends into April 2017
 - transactions.csv only goes to March 31, 2017 — April data is absent
+- Quantified: 98.27% of the 40,227-user March-anchored cohort has a renewal window that runs past 2017-03-31 (see `explore/date_issues_check.py` Cell 1) — i.e. almost none of this cohort's labels are independently verifiable from this extract
 - This means we cannot independently verify labels for users expiring mid-to-late March
 - Action: use train.csv labels as authoritative (KKBox generated them with full data); do not attempt to regenerate labels
 
-**Error 4 — Incomplete transactions extract:**
+**Error 3 — Incomplete transactions extract (revised — see `explore/anchor_hypothesis_check.py`):**
 - train.csv has 970,960 users; only ~40,227 have a verified March 2017 expiry in our transactions.csv
-- The remaining ~930K users' March expiry records are missing from our extract
-- For users without a verified March expiry in transactions.csv, use a global fallback feature_cutoff of 2017-02-15 and flag has_anchor = 0
+- These ~930K users are NOT missing data by error. Their own latest transaction record shows a real, later expiry: 84.56% expire in April 2017, 8.54% in May 2017, spread further out after that — only 3.93% (37,382 users) have zero transaction rows at all
+- Tested and rejected the hypothesis that this is caused by longer subscription plans: median `payment_plan_days` is 30 days for both the March-anchored group and the April/May groups — plan length is not the driver
+- What actually determines it: `membership_expire_date` extends forward from a user's *existing* expiry on renewal (early renewals stack on remaining time), not fresh from `transaction_date + payment_plan_days`. So where a user's expiry lands as of the 2017-03-31 snapshot is a product of their whole personal renewal history, not plan length or a data gap
+- **Open question, still not resolved:** this means train.csv is not literally "everyone whose subscription expires in March 2017" — only ~4% of train.csv empirically shows that. Why KKBox included the other ~96% in this cohort can't be reconstructed from this extract alone
+- **Decision (superseded the fallback approach):** train on the anchored ~40,227 users only. No `has_anchor` column, no global fallback feature_cutoff of 2017-02-15 — those ~930K users are excluded from training entirely rather than filled in. Rationale: every user scored in production has a real, known expiry date (`has_anchor` was always 1 at serving time anyway), so training exclusively on real per-user anchors removes a train/serve skew rather than papering over it with a fallback cutoff that never occurs at serving time
+- This is a deliberate experiment, not an assumed win — validate against the previous full-cohort+fallback approach on the same held-out set before trusting it
+- Known tradeoff accepted: training set shrinks from 970,960 to 40,227 rows (~3,600 churn examples instead of ~87,330), and the anchored cohort skews toward 30-day-plan subscribers (median plan length identical between anchored and non-anchored groups, tested in `explore/anchor_hypothesis_check.py` — so this reflects KKBox's subscription base, not a bias introduced by anchoring; KKBox's own churn definition is already built around the 30-day/monthly-renewal case)
 
-**Error 5 — Future registration dates in members.csv (55,094 rows):**
+**Error 4 — Future registration dates in members.csv (55,094 rows):**
 - registration_init_time > 20170331 (registered after the eval period)
 - Likely data integrity issue from a later system export
 - Action: exclude these rows from tenure calculation; treat tenure_days as NULL for these users
@@ -210,7 +219,9 @@ Reduced to a thin training wrapper:
 1. Stage 1: anchor logic (training-specific — builds user cohort from `train.csv` + `transactions.csv`)
 2. Stage 2: compute p99_secs, save to `models/feature_config.json`
 3. Stage 3: call `build_features()` with the cohort's expire dates
-4. Stage 4: join `is_churn`/`has_anchor` metadata back in, export parquet
+4. Stage 4: join `is_churn` metadata back in, export parquet
+
+(Originally Stage 4 also carried a `has_anchor` flag alongside `is_churn`, for the ~930K users given a fallback feature_cutoff. That fallback path was later removed — see Error 3's revised entry above — so Stage 1 now only returns anchored users and there is no `has_anchor` column.)
 
 The inline Stages 2-5 (txn, log, member feature SQL + join) were removed — that logic now lives exclusively in `src/core/feature_module.py`.
 
@@ -224,25 +235,6 @@ Running `python src/training/features.py` after the refactor produces identical 
 ---
 
 ## Serving Pipeline & Score API (Steps 3 & 4)
-
-### Files added
-
-| File | Purpose |
-|---|---|
-| `src/config.py` | Frozen dataclasses (`PostgresConfig`, `MLflowConfig`, `ServingConfig`, `ApiConfig`) loaded from env vars. `POSTGRES_PASSWORD` has no default — fails fast if absent. |
-| `src/core/model_loader.py` | Factory + abstract loader. `make_model_loader(use_mlflow=True/False)` returns `MLflowModelLoader` or `PickleModelLoader`. Callers never instantiate directly. |
-| `src/core/risk_tier.py` | Strategy pattern. `make_tier_strategy(tier_config).assign(scores)` → `list["HIGH"\|"MED"\|"LOW"]`. Add new strategies as subclasses without touching the pipeline. |
-| `src/pipelines/serve.py` | Prefect `@flow` with 8 `@task` functions. CLI: `python src/pipelines/serve.py --date YYYY-MM-DD --no-mlflow`. |
-| `src/api/main.py` | FastAPI app factory + lifespan (pool lifecycle). |
-| `src/api/schemas.py` | Pydantic schemas: `PredictionRecord`, `CohortResponse`, `ErrorResponse`, `HealthResponse`. |
-| `src/api/exceptions.py` | Custom exceptions + all exception handlers registered in `create_app()`. |
-| `src/api/dependencies.py` | FastAPI `Depends()` providers for pool and repository. |
-| `src/api/repositories/base.py` | `AbstractPredictionRepository` — 3-method interface. |
-| `src/api/repositories/postgres.py` | `PostgresPredictionRepository` — owns all SQL; uses server-side cursor for cohort > 50K rows. |
-| `src/api/routers/score.py` | `GET /score/{user_id}` |
-| `src/api/routers/cohort.py` | `GET /cohort?date=YYYY-MM-DD` |
-| `models/risk_tiers_config.json` | Versioned tier thresholds: HIGH ≥ 0.5, MED [0.2, 0.5), LOW < 0.2. |
-
 
 ### LightGBM Booster vs sklearn predict_proba
 
@@ -304,39 +296,10 @@ curl "http://localhost:8000/score/user with spaces"
 
 OpenAPI docs auto-generated at `http://localhost:8000/docs`.
 
----
-
-## src/ Layout (post Step 5 reorganization)
-
-```
-src/
-├── config.py          — shared infra config: PostgresConfig, ServingConfig, LabelingConfig, ApiConfig
-├── core/              — pure domain logic (no Prefect, no psycopg2, no side effects)
-│   ├── feature_module.py    build_features(), FEATURE_COLS, CAT_COLS
-│   ├── label_module.py      build_cohort(), compute_labels(), LABEL_COLS
-│   ├── model_loader.py      make_model_loader() factory
-│   └── risk_tier.py         make_tier_strategy() factory
-├── pipelines/         — Prefect @flow + @task, CLI entry points
-│   ├── label.py             monthly labeling pipeline
-│   └── serve.py             daily scoring pipeline
-├── training/          — one-off training scripts
-│   ├── features.py          build train_features.parquet
-│   └── train.py             train LightGBM baseline
-└── api/               — FastAPI Score API (unchanged)
-    └── ...
-```
 
 ---
 
 ## Labeling Pipeline (Step 5)
-
-### Files added / modified
-
-| File | Change | Purpose |
-|---|---|---|
-| `src/config.py` | Modified | Added `LabelingConfig` dataclass + `load_labeling_config()` function |
-| `src/core/label_module.py` | New | Pure labeling domain logic — no Prefect, no psycopg2, no side effects |
-| `src/pipelines/label.py` | New | Prefect `@flow` with 4 `@task` functions. CLI: `python src/pipelines/label.py --cohort-month YYYY-MM` |
 
 ### Design decisions
 
@@ -344,7 +307,7 @@ src/
 The labeling pipeline is a production component: after the model is deployed, future cohort labels come from transaction renewal patterns, not from KKBox. Reading train.csv labels belongs to `training/features.py` (training data prep only). The pipeline has no `label_source` switch; `compute_labels()` always calls `_label_from_transactions()`.
 
 **`build_cohort()` in `core/label_module.py` is NOT `training/features.py` Stage 1.**
-`features.py` Stage 1 starts with all 970K train.csv users and computes per-user anchors (including the `has_anchor=0` fallback). `build_cohort()` starts from transactions and only returns users with a confirmed expiry in the target month (~40K for March 2017). The `labels` table only stores users with a verified `anchor_expiry_date`; users with `has_anchor=0` appear only in `train_labels`.
+`features.py` Stage 1 starts from `train.csv`'s fixed, already-labeled 970,960 users and joins to transactions to find each user's March 2017 anchor, keeping only the ~40K with a verified match (see Error 3's revised entry — no fallback cutoff since that decision). `build_cohort()` starts from transactions directly and returns users with a confirmed expiry in the target month for whatever future cohort is being labeled — it doesn't depend on train.csv at all, since production labeling has no equivalent of train.csv to start from.
 
 **DuckDB source abstraction via `_register_txn_source()`.**
 Creates a `v_transactions` view pointing at either CSV files or `pg.transactions`. All labeling SQL is identical for both data sources.

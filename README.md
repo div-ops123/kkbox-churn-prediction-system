@@ -256,6 +256,15 @@ OpenAPI docs: `http://localhost:8000/docs`
 | Grafana monitoring | http://localhost:3000 | admin / admin |
 | MLflow experiments | http://localhost:5000 | — |
 
+
+# What's missing that will hurt you:
+1. No Docker container for the app itself. q: why do i have to containerize the app?
+2. Prefect pipelines not actually running — they're decorated but manual.
+3. No live URL. This means you can't show a founder "here, hit this endpoint right now." That's a gap.
+
+
+
+
 ### Project Layout
 
 ```
