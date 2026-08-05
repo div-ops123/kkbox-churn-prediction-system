@@ -131,9 +131,7 @@ for group_label, cols in FEATURE_GROUPS.items():
         print(f"    {col:<30}  {pct:5.1f}%  {bar}")
 
 print("\n  [metadata — excluded from model]")
-n_fallback = (df["has_anchor"] == 0).sum()
-n_no_log   = (df["has_log_data"] == 0).sum()
-print(f"    has_anchor = 0 (fallback cutoff):    {n_fallback:,}  ({n_fallback/len(df):.1%})")
+n_no_log = (df["has_log_data"] == 0).sum()
 print(f"    has_log_data = 0 (no logs in window): {n_no_log:,}  ({n_no_log/len(df):.1%})")
 print(SEP)
 # %%
@@ -142,8 +140,8 @@ df.head()
 
 # %%
 # ── 3. Feature matrix ─────────────────────────────────────────────────────────
-# has_anchor excluded: always 1 at serving time — spurious training artifact.
 # has_log_data excluded: redundant with log feature nulls (LightGBM sees NaN).
+# (has_anchor no longer exists — training is anchored-only now, see features.py)
 
 X = df[FEATURE_COLS]
 y = df["is_churn"]

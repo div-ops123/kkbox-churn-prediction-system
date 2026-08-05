@@ -165,8 +165,19 @@ previous full-cohort-plus-fallback approach on the same held-out set before trus
 
 Stated plainly, not buried in the code:
 
-- **Sample size collapses**: 970,960 → 40,227 rows, and ~87,330 → roughly 3,600 churn examples.
-  A real variance/overfitting risk for the minority class, not just a cleanliness win.
+- **Sample size collapses**: 970,960 → 39,972 rows.
+- **Churn is no longer a minority class in this cohort — verified by running the actual
+  pipeline, not estimated**: churn rate jumps from 8.99% (full `train.csv`) to **48.46%**
+  (19,367 of 39,972 anchored users). This is a materially bigger shift than "selection skew"
+  implies on its own — conditioning on "has a verified March expiry" selects almost
+  specifically for users at their renewal decision point. Users who keep renewing roll their
+  `membership_expire_date` forward past March and drop out of this cohort entirely (they're
+  exactly the ~930K "unanchored" users from §3/§5, 84.56% of whom show a later, April expiry).
+  So the anchored cohort isn't just smaller — it's a fundamentally different population,
+  weighted toward users already near a churn/renew decision, not a random sample of subscribers.
+  This changes the interpretation of any metric trained on it: `scale_pos_weight` will be
+  close to 1 instead of ~10, and performance here should not be assumed to generalize to
+  scoring a full, unconditioned production cohort without accounting for this shift.
 - **Does not fix the log-data gap.** Even within the anchored cohort, **52.6%** of users
   (21,141 of 40,227) still have zero `user_logs` rows before their own cutoff — because
   `user_logs.csv` only covers March, a completely separate root cause from anchor status.

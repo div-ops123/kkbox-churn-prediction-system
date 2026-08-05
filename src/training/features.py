@@ -9,10 +9,14 @@ Pipeline:
 
 Notes:
   - feature_cutoff_dt = expire_dt - 14 days, enforced inside build_features()
-  - Fallback expire_dt = 2017-03-01 (cutoff = 2017-02-15) for ~930K users whose
-    March expiry is absent from transactions.csv
+  - Training cohort is anchored-only: only the ~40K train.csv users with a verified
+    March 2017 expiry in transactions.csv. The other ~930K are excluded rather than
+    given a fallback cutoff — every user scored in production has a real, known
+    expiry date (has_anchor is always 1 at serving time), so training exclusively
+    on real anchors removes a train/serve skew the fallback used to introduce.
+    This is a deliberate experiment, not an assumption that it outperforms the
+    full-cohort+fallback approach — validate both on the same held-out set.
   - LightGBM handles NaN natively; do NOT fill NaN with 0
-  - has_anchor is metadata only — excluded from model features (always 1 at serving time)
 """
 
 import json
@@ -31,40 +35,32 @@ OUT      = DATA / "train_features.parquet"
 
 # ── Stage 1: Base table ───────────────────────────────────────────────────────
 # For each train.csv user, find their latest March 2017 expiry in transactions.csv.
-# Exclude bad-expiry rows (membership_expire_date < transaction_date).
-# ~40K users get a precise anchor; ~930K get the fallback expire_dt of 2017-03-01.
-print("Stage 1: building base table...")
+# JOIN (not LEFT JOIN) means users with no March-2017 expiry are dropped entirely —
+# no fallback cutoff, no has_anchor flag. Every remaining user has a real,
+# per-user anchor_expiry_dt, matching what production always has at serving time.
+#
+# The old join condition also required membership_expire_date >= transaction_date,
+# to exclude rows that looked like backdated cancellations. That turned out to be
+# a false alarm (explore/date_issues_check.py Cell 2): every one of those rows is
+# a 1-3 day gap between expiry and a cancellation being processed shortly after —
+# ordinary behavior, not corrupted data — so that exclusion has been dropped here too.
+print("Stage 1: building base table (anchored users only)...")
 con = duckdb.connect()
 con.execute(f"""
 CREATE OR REPLACE TABLE base AS
-WITH anchor AS (
-    SELECT
-        tr.msno,
-        tr.is_churn,
-        MAX(t.membership_expire_date) AS anchor_int
-    FROM read_csv_auto('{DATA.as_posix()}/train.csv') tr
-    LEFT JOIN read_csv_auto('{DATA.as_posix()}/transactions.csv') t
-        ON  tr.msno = t.msno
-        AND t.membership_expire_date BETWEEN 20170301 AND 20170331
-        AND t.membership_expire_date >= t.transaction_date
-    GROUP BY tr.msno, tr.is_churn
-)
 SELECT
-    msno,
-    is_churn,
-    CASE WHEN anchor_int IS NOT NULL THEN 1 ELSE 0 END AS has_anchor,
-    -- expire_dt is passed to build_features(); it computes cutoff = expire_dt - 14 days
-    CASE
-        WHEN anchor_int IS NOT NULL
-        THEN STRPTIME(CAST(anchor_int AS VARCHAR), '%Y%m%d')
-        ELSE DATE '2017-03-01'    -- cutoff = 2017-02-15 (= 2017-03-01 - 14 days)
-    END AS expire_dt
-FROM anchor
+    tr.msno,
+    tr.is_churn,
+    STRPTIME(CAST(MAX(t.membership_expire_date) AS VARCHAR), '%Y%m%d') AS expire_dt
+FROM read_csv_auto('{DATA.as_posix()}/train.csv') tr
+JOIN read_csv_auto('{DATA.as_posix()}/transactions.csv') t
+    ON  tr.msno = t.msno
+    AND t.membership_expire_date BETWEEN 20170301 AND 20170331
+GROUP BY tr.msno, tr.is_churn
 """)
-n_base     = con.execute("SELECT COUNT(*) FROM base").fetchone()[0]
-n_anchored = con.execute("SELECT SUM(has_anchor) FROM base").fetchone()[0]
-print(f"  {n_base:,} users | {n_anchored:,} anchored ({n_anchored/n_base:.1%}) | "
-      f"{n_base - n_anchored:,} fallback ({(n_base - n_anchored)/n_base:.1%})")
+n_base = con.execute("SELECT COUNT(*) FROM base").fetchone()[0]
+print(f"  {n_base:,} anchored users (train.csv users without a verified "
+      f"March 2017 expiry are excluded, not fallback-filled)")
 
 # ── Stage 2: Compute p99_secs once and freeze for serving ────────────────────
 print("Stage 2: computing log p99_secs...")
@@ -81,7 +77,7 @@ with open(_config_path, "w") as _f:
 print(f"  Saved feature_config.json -> {_config_path}")
 
 # Extract base table before closing connection
-base_df = con.execute("SELECT msno, is_churn, has_anchor, expire_dt FROM base").df()
+base_df = con.execute("SELECT msno, is_churn, expire_dt FROM base").df()
 con.close()
 
 # ── Stage 3: Build features via shared module ─────────────────────────────────
@@ -97,7 +93,7 @@ print(f"  feature matrix: {features_df.shape[0]:,} rows x {features_df.shape[1]}
 
 # ── Stage 4: Join labels/metadata and export ─────────────────────────────────
 print("Stage 4: joining labels and exporting...")
-labels = base_df.set_index("msno")[["is_churn", "has_anchor"]]
+labels = base_df.set_index("msno")[["is_churn"]]
 final  = labels.join(features_df, how="left")
 final["has_log_data"] = final["log_days"].notna().astype("int8")
 final = final.reset_index()
