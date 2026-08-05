@@ -88,27 +88,40 @@ class LabelingConfig:
 
 
 @dataclass(frozen=True)
-class TrainingConfig:
+class DatasetBuildConfig:
     postgres: PostgresConfig
     mlflow: MLflowConfig
     data_source: str                # "csv" | "postgres"
     data_dir: Path
-    feature_config_path: Path
-    baseline_features_path: Path   # models/baseline_features.parquet
     cohort_months: tuple[str, ...]  # ("YYYY-MM", ...) or () for all available months
     val_fraction: float
+    test_fraction: float
+    log_level: str
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    postgres: PostgresConfig
+    mlflow: MLflowConfig
     early_stopping_rounds: int
     n_estimators: int
     log_level: str
 
 
 @dataclass(frozen=True)
+class ValidationConfig:
+    postgres: PostgresConfig
+    mlflow: MLflowConfig
+    top_k: int                     # Precision/Recall@K cutoff
+    log_level: str
+
+
+@dataclass(frozen=True)
 class MonitoringConfig:
     postgres: PostgresConfig
+    mlflow: MLflowConfig
     data_source: str                # "csv" | "postgres"
     data_dir: Path
-    feature_config_path: Path
-    baseline_features_path: Path   # models/baseline_features.parquet
     psi_alert_threshold: float     # PSI > this triggers a data_drift alert
     auc_pr_alert_threshold: float  # AUC-PR < this triggers a model_perf alert
     top_k: int                     # Precision/Recall@K cutoff
@@ -235,18 +248,18 @@ def load_labeling_config(
     )
 
 
-def load_training_config(
+def load_dataset_build_config(
     cohort_months: list[str] | None = None,
     data_source: str = "postgres",
     data_dir: str = "data/",
-) -> TrainingConfig:
+) -> DatasetBuildConfig:
     """
-    Read environment variables and return a frozen TrainingConfig.
+    Read environment variables and return a frozen DatasetBuildConfig.
 
     Parameters
     ----------
-    cohort_months : list of "YYYY-MM" strings to train on, or None / [] to use
-                    all rows currently in the labels table.
+    cohort_months : list of "YYYY-MM" strings to build the dataset from, or
+                    None / [] to use all rows currently in the labels table.
     data_source   : "postgres" (default) | "csv" (dev / testing only).
     data_dir      : relative path to the CSV directory.
 
@@ -265,10 +278,56 @@ def load_training_config(
                 raise ValueError(f"cohort_months entries must be 'YYYY-MM', got {m!r}")
         months = tuple(cohort_months)
 
-    val_fraction = float(os.getenv("TRAINING_VAL_FRACTION", "0.2"))
+    val_fraction = float(os.getenv("DATASET_VAL_FRACTION", "0.15"))
     if not (0.0 < val_fraction < 1.0):
-        raise ValueError(f"TRAINING_VAL_FRACTION must be in (0, 1), got {val_fraction}")
+        raise ValueError(f"DATASET_VAL_FRACTION must be in (0, 1), got {val_fraction}")
 
+    test_fraction = float(os.getenv("DATASET_TEST_FRACTION", "0.15"))
+    if not (0.0 < test_fraction < 1.0):
+        raise ValueError(f"DATASET_TEST_FRACTION must be in (0, 1), got {test_fraction}")
+
+    if val_fraction + test_fraction >= 1.0:
+        raise ValueError(
+            f"DATASET_VAL_FRACTION + DATASET_TEST_FRACTION must be < 1.0, "
+            f"got {val_fraction} + {test_fraction}"
+        )
+
+    pg = _require_postgres()
+    mlflow_cfg = MLflowConfig(
+        tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
+        model_name=os.getenv("MLFLOW_MODEL_NAME", "LightGBMChurnClassifier"),
+        model_alias=os.getenv("MLFLOW_MODEL_ALIAS", "production"),
+    )
+    return DatasetBuildConfig(
+        postgres=pg,
+        mlflow=mlflow_cfg,
+        data_source=data_source,
+        data_dir=BASE_DIR / data_dir,
+        cohort_months=months,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+    )
+
+
+def load_training_config(
+    n_estimators: int | None = None,
+    early_stopping_rounds: int | None = None,
+) -> TrainingConfig:
+    """
+    Read environment variables and return a frozen TrainingConfig.
+
+    The training pipeline no longer touches raw data or builds features —
+    it consumes a dataset already built and persisted by the dataset-build
+    pipeline (see load_dataset_build_config / run_dataset_build_pipeline).
+
+    Parameters
+    ----------
+    n_estimators          : override for TRAINING_N_ESTIMATORS env var.
+    early_stopping_rounds : override for TRAINING_EARLY_STOPPING_ROUNDS env var.
+
+    Raises EnvironmentError if POSTGRES_PASSWORD is not set.
+    """
     pg = _require_postgres()
     mlflow_cfg = MLflowConfig(
         tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
@@ -278,14 +337,40 @@ def load_training_config(
     return TrainingConfig(
         postgres=pg,
         mlflow=mlflow_cfg,
-        data_source=data_source,
-        data_dir=BASE_DIR / data_dir,
-        feature_config_path=BASE_DIR / os.getenv("FEATURE_CONFIG_PATH", "models/feature_config.json"),
-        baseline_features_path=BASE_DIR / os.getenv("BASELINE_FEATURES_PATH", "models/baseline_features.parquet"),
-        cohort_months=months,
-        val_fraction=val_fraction,
-        early_stopping_rounds=int(os.getenv("TRAINING_EARLY_STOPPING_ROUNDS", "50")),
-        n_estimators=int(os.getenv("TRAINING_N_ESTIMATORS", "1000")),
+        early_stopping_rounds=(
+            early_stopping_rounds
+            if early_stopping_rounds is not None
+            else int(os.getenv("TRAINING_EARLY_STOPPING_ROUNDS", "50"))
+        ),
+        n_estimators=(
+            n_estimators
+            if n_estimators is not None
+            else int(os.getenv("TRAINING_N_ESTIMATORS", "1000"))
+        ),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+    )
+
+
+def load_validation_config() -> ValidationConfig:
+    """
+    Read environment variables and return a frozen ValidationConfig.
+
+    Raises EnvironmentError if POSTGRES_PASSWORD is not set.
+    """
+    pg = _require_postgres()
+    mlflow_cfg = MLflowConfig(
+        tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
+        model_name=os.getenv("MLFLOW_MODEL_NAME", "LightGBMChurnClassifier"),
+        model_alias=os.getenv("MLFLOW_MODEL_ALIAS", "production"),
+    )
+    top_k = int(os.getenv("VALIDATION_TOP_K", "100"))
+    if top_k <= 0:
+        raise ValueError(f"VALIDATION_TOP_K must be positive, got {top_k}")
+
+    return ValidationConfig(
+        postgres=pg,
+        mlflow=mlflow_cfg,
+        top_k=top_k,
         log_level=os.getenv("LOG_LEVEL", "INFO"),
     )
 
@@ -305,13 +390,15 @@ def load_monitoring_config(
     Raises EnvironmentError if POSTGRES_PASSWORD is not set.
     Raises ValueError for invalid data_source or out-of-range thresholds.
 
+    p99_secs and the drift baseline are no longer read from local files —
+    the drift check resolves them from whatever dataset produced the model
+    currently aliased "production" (see core.model_loader.get_model_version_dataset_id).
+
     Env vars
     --------
-    BASELINE_FEATURES_PATH    default: models/baseline_features.parquet
-    MONITORING_PSI_THRESHOLD  default: 0.2
+    MONITORING_PSI_THRESHOLD    default: 0.2
     MONITORING_AUC_PR_THRESHOLD default: 0.45
-    MONITORING_TOP_K          default: 100
-    FEATURE_CONFIG_PATH       default: models/feature_config.json
+    MONITORING_TOP_K            default: 100
     """
     if data_source not in ("csv", "postgres"):
         raise ValueError(
@@ -333,12 +420,16 @@ def load_monitoring_config(
         raise ValueError(f"MONITORING_TOP_K must be positive, got {top_k}")
 
     pg = _require_postgres()
+    mlflow_cfg = MLflowConfig(
+        tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
+        model_name=os.getenv("MLFLOW_MODEL_NAME", "LightGBMChurnClassifier"),
+        model_alias=os.getenv("MLFLOW_MODEL_ALIAS", "production"),
+    )
     return MonitoringConfig(
         postgres=pg,
+        mlflow=mlflow_cfg,
         data_source=data_source,
         data_dir=BASE_DIR / data_dir,
-        feature_config_path=BASE_DIR / os.getenv("FEATURE_CONFIG_PATH", "models/feature_config.json"),
-        baseline_features_path=BASE_DIR / os.getenv("BASELINE_FEATURES_PATH", "models/baseline_features.parquet"),
         psi_alert_threshold=psi_threshold,
         auc_pr_alert_threshold=auc_pr_threshold,
         top_k=top_k,

@@ -9,6 +9,7 @@ Public API
     TrainArtifact            — dataclass: trained Booster + all metrics frozen at training time
     compute_p99_secs(...)    → float
     split_cohort(...)        → (train_df, val_df)
+    split_cohort_3way(...)   → (train_df, val_df, test_df)
     train_lgbm(...)          → TrainArtifact
     evaluate_on_holdout(...) → dict
 """
@@ -142,6 +143,55 @@ def split_cohort(
         stratify=features_df["is_churn"],
     )
     return train_df.copy(), val_df.copy()
+
+
+def split_cohort_3way(
+    features_df: pd.DataFrame,
+    val_fraction: float = 0.15,
+    test_fraction: float = 0.15,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Split features_df into (train_df, val_df, test_df).
+
+    Strategy
+    --------
+    - If features_df has a 'cohort_month' column with >= 3 distinct values:
+        rolling time-based split — the most recent cohort_month becomes test
+        (held out entirely from training, used only by the validation
+        pipeline's promotion decision), the second-most-recent becomes val
+        (used for early stopping during training), everything older becomes
+        train.
+    - Otherwise:
+        stratified random 3-way split on is_churn.
+
+    features_df must have an 'is_churn' column. Index is preserved.
+    """
+    if "cohort_month" in features_df.columns:
+        months = sorted(features_df["cohort_month"].dropna().unique())
+        if len(months) >= 3:
+            test_month = months[-1]
+            val_month = months[-2]
+            holdout_months = {val_month, test_month}
+            train_df = features_df[~features_df["cohort_month"].isin(holdout_months)].copy()
+            val_df = features_df[features_df["cohort_month"] == val_month].copy()
+            test_df = features_df[features_df["cohort_month"] == test_month].copy()
+            return train_df, val_df, test_df
+
+    train_df, temp_df = train_test_split(
+        features_df,
+        test_size=val_fraction + test_fraction,
+        random_state=seed,
+        stratify=features_df["is_churn"],
+    )
+    relative_test_fraction = test_fraction / (val_fraction + test_fraction)
+    val_df, test_df = train_test_split(
+        temp_df,
+        test_size=relative_test_fraction,
+        random_state=seed,
+        stratify=temp_df["is_churn"],
+    )
+    return train_df.copy(), val_df.copy(), test_df.copy()
 
 
 def train_lgbm(

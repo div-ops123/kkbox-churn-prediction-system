@@ -22,13 +22,16 @@ use_mlflow : bool
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
+import tempfile
 from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Generator
 
+import mlflow
 import numpy as np
 import pandas as pd
 import psycopg2
@@ -183,10 +186,13 @@ def build_feature_matrix(
 def load_production_model(
     config: ServingConfig,
     use_mlflow: bool = True,
-) -> tuple[ScoringModel, str]:
+) -> tuple[ScoringModel, str, str | None]:
     """
-    Load the production model. Returns (model, model_version_str).
+    Load the production model. Returns (model, model_version_str, dataset_version_id).
     model_version_str is the MLflow run_id (or a label for local pickle).
+    dataset_version_id is the MLflow run_id of the dataset-build run this
+    model was trained on (None for the local dev pickle, which carries no
+    dataset lineage) — used to fetch the matching p99_secs.
     """
     logger = get_run_logger()
     loader = make_model_loader(
@@ -197,8 +203,42 @@ def load_production_model(
     )
     model = loader.load()
     version = loader.get_model_version()
-    logger.info(f"load_production_model complete | version={version} | use_mlflow={use_mlflow} | alias={config.mlflow.model_alias}")
-    return model, version
+    dataset_version_id = loader.get_dataset_version_id()
+    logger.info(
+        f"load_production_model complete | version={version} | use_mlflow={use_mlflow}"
+        f" | alias={config.mlflow.model_alias} | dataset_version_id={dataset_version_id}"
+    )
+    return model, version, dataset_version_id
+
+
+@task(name="resolve-p99-secs", retries=2, retry_delay_seconds=30, tags=["mlflow", "features"])
+def resolve_p99_secs(
+    dataset_version_id: str | None,
+    config: ServingConfig,
+) -> float:
+    """
+    Fetch p99_secs from the dataset-build run that trained the currently
+    loaded production model, so serving always winsorizes with the same
+    threshold the model was trained on — never a stale local file.
+
+    Falls back to the local models/feature_config.json only when there is no
+    dataset_version_id (the --no-mlflow local dev pickle path).
+    """
+    logger = get_run_logger()
+    if dataset_version_id is None:
+        p99_secs = load_feature_config(config.feature_config_path)["p99_secs"]
+        logger.info(f"resolve_p99_secs | no dataset_version_id (dev pickle) — using local file | p99_secs={p99_secs}")
+        return p99_secs
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_dir = mlflow.artifacts.download_artifacts(
+            run_id=dataset_version_id, artifact_path="dataset", dst_path=tmpdir,
+        )
+        with open(Path(local_dir) / "feature_config.json") as f:
+            p99_secs = json.load(f)["p99_secs"]
+
+    logger.info(f"resolve_p99_secs complete | dataset_version_id={dataset_version_id} | p99_secs={p99_secs}")
+    return p99_secs
 
 
 @task(name="score-cohort", retries=0, tags=["inference"])
@@ -462,7 +502,6 @@ def run_serving_pipeline(
         scoring_date = date.today()
 
     config = load_serving_config()
-    p99_secs = load_feature_config(config.feature_config_path)["p99_secs"]
     tier_config = load_risk_tiers_config(config.risk_tiers_config_path)
 
     logger.info(
@@ -489,7 +528,8 @@ def run_serving_pipeline(
         }
 
     # ── Steps 2-6: Model, features, scores, tiers, writes ────────────────────
-    model, model_version = load_production_model(config=config, use_mlflow=use_mlflow)
+    model, model_version, dataset_version_id = load_production_model(config=config, use_mlflow=use_mlflow)
+    p99_secs = resolve_p99_secs(dataset_version_id=dataset_version_id, config=config)
     feature_df = build_feature_matrix(cohort_df=cohort_df, config=config, p99_secs=p99_secs)
     scores = score_cohort(feature_df=feature_df, model=model)
     tiers = assign_risk_tiers(scores=scores, tier_config=tier_config)

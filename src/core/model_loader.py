@@ -9,6 +9,8 @@ Public API
     make_model_loader(use_mlflow, ...) -> BaseModelLoader
     model = loader.load()
     version = loader.get_model_version()
+    dataset_version_id = loader.get_dataset_version_id()
+    get_model_version_dataset_id(mlflow_config, alias) -> str | None  — tag lookup without loading the model
 """
 
 from __future__ import annotations
@@ -44,6 +46,15 @@ class BaseModelLoader(ABC):
         """Return a version string to stamp on every prediction row."""
         ...
 
+    @abstractmethod
+    def get_dataset_version_id(self) -> str | None:
+        """
+        Return the dataset_version_id (dataset-build MLflow run_id) tagged on
+        the loaded model version, or None if the loaded model has no such tag
+        (e.g. a local dev pickle, or a model registered before this tag existed).
+        """
+        ...
+
 
 # ── MLflow loader ─────────────────────────────────────────────────────────────
 
@@ -59,6 +70,7 @@ class MLflowModelLoader(BaseModelLoader):
         self._model_name = model_name
         self._alias = alias
         self._version: str | None = None
+        self._dataset_version_id: str | None = None
 
     def load(self) -> ScoringModel:
         try:
@@ -79,6 +91,7 @@ class MLflowModelLoader(BaseModelLoader):
             ) from exc
 
         self._version = mv.run_id
+        self._dataset_version_id = mv.tags.get("dataset_version_id")
         model_uri = f"models:/{self._model_name}/{mv.version}"
         try:
             model = mlflow.lightgbm.load_model(model_uri)
@@ -97,6 +110,11 @@ class MLflowModelLoader(BaseModelLoader):
         if self._version is None:
             raise RuntimeError("Call load() before get_model_version()")
         return self._version
+
+    def get_dataset_version_id(self) -> str | None:
+        if self._version is None:
+            raise RuntimeError("Call load() before get_dataset_version_id()")
+        return self._dataset_version_id
 
 
 # ── Pickle loader ─────────────────────────────────────────────────────────────
@@ -130,6 +148,38 @@ class PickleModelLoader(BaseModelLoader):
 
     def get_model_version(self) -> str:
         return self._version_label
+
+    def get_dataset_version_id(self) -> str | None:
+        """Local dev pickles carry no dataset lineage."""
+        return None
+
+
+# ── Standalone lookups ────────────────────────────────────────────────────────
+
+def get_model_version_dataset_id(mlflow_config: Any, alias: str) -> str | None:
+    """
+    Look up the dataset_version_id tag on whichever model version currently
+    holds `alias`, without deserializing the model itself.
+
+    Used by pipelines (e.g. monitor.py's drift check) that need to know which
+    dataset produced the current production model but don't need the model
+    object loaded into memory.
+
+    Returns None if the tag is missing. Raises ModelNotFoundError if no model
+    version currently holds `alias`.
+    """
+    import mlflow
+
+    mlflow.set_tracking_uri(mlflow_config.tracking_uri)
+    client = mlflow.MlflowClient()
+    try:
+        mv = client.get_model_version_by_alias(mlflow_config.model_name, alias)
+    except Exception as exc:
+        raise ModelNotFoundError(
+            f"No model '{mlflow_config.model_name}' with alias '{alias}' "
+            f"in registry at {mlflow_config.tracking_uri}"
+        ) from exc
+    return mv.tags.get("dataset_version_id")
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────

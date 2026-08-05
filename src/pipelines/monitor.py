@@ -10,7 +10,8 @@ Track 2 (run_performance_monitoring): Monthly. Joins month M predictions with
     6 rows to monitoring_metrics. Optionally triggers retraining when AUC-PR
     falls below threshold.
 
-Track 3 (pipeline health) is handled inline by serve.py, label.py, and train.py.
+Track 3 (pipeline health) is handled inline by serve.py, label.py,
+    build_dataset.py, train.py, and validate.py.
 
 Run locally:
     python src/pipelines/monitor.py drift --date 2017-03-15 --data-source csv
@@ -20,13 +21,16 @@ Run locally:
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
+import tempfile
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from typing import Generator
 
+import mlflow
 import pandas as pd
 import psycopg2
 import psycopg2.extras
@@ -35,9 +39,10 @@ from prefect import flow, get_run_logger, task
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import MonitoringConfig, load_feature_config, load_monitoring_config
+from config import MonitoringConfig, load_monitoring_config
 from core.drift_module import compute_feature_drift, evaluate_cohort_performance
 from core.feature_module import FEATURE_COLS, build_features
+from core.model_loader import ModelNotFoundError, get_model_version_dataset_id
 
 
 # ── Custom exceptions ──────────────────────────────────────────────────────────
@@ -148,6 +153,60 @@ def load_serving_cohort(config: MonitoringConfig, scoring_date: date) -> pd.Data
     return df
 
 
+@task(name="resolve-production-dataset", retries=2, retry_delay_seconds=30, tags=["mlflow", "drift"])
+def resolve_production_dataset_version_id(config: MonitoringConfig) -> str:
+    """
+    Look up the dataset_version_id tag on whichever model version currently
+    holds the production alias, without loading the model itself.
+
+    Raises BaselineNotFoundError if no model currently holds the production
+    alias (first run, before any training has happened), or if it has no
+    dataset_version_id tag (registered before this pipeline existed).
+    """
+    logger = get_run_logger()
+    try:
+        dataset_version_id = get_model_version_dataset_id(config.mlflow, config.mlflow.model_alias)
+    except ModelNotFoundError as exc:
+        raise BaselineNotFoundError(
+            f"No production model found: {exc}. Run the training + validation "
+            "pipelines to establish one."
+        ) from exc
+
+    if dataset_version_id is None:
+        raise BaselineNotFoundError(
+            "Production model has no dataset_version_id tag — it was likely "
+            "registered before this pipeline existed. Retrain to backfill it."
+        )
+    logger.info(f"resolve_production_dataset_version_id | dataset_version_id={dataset_version_id}")
+    return dataset_version_id
+
+
+@task(name="load-baseline-and-p99", retries=2, retry_delay_seconds=30, tags=["mlflow", "drift"])
+def load_baseline_and_p99(dataset_version_id: str, config: MonitoringConfig) -> tuple[pd.DataFrame, float]:
+    """
+    Fetch baseline_features.parquet and p99_secs from the dataset-build
+    MLflow run that trained the current production model — never a local
+    file, so drift is always compared against what production actually
+    trained on.
+    """
+    logger = get_run_logger()
+    mlflow.set_tracking_uri(config.mlflow.tracking_uri)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_dir = mlflow.artifacts.download_artifacts(
+            run_id=dataset_version_id, artifact_path="dataset", dst_path=tmpdir,
+        )
+        baseline_df = pd.read_parquet(Path(local_dir) / "baseline_features.parquet")
+        with open(Path(local_dir) / "feature_config.json") as f:
+            p99_secs = json.load(f)["p99_secs"]
+
+    logger.info(
+        f"load_baseline_and_p99 complete | dataset_version_id={dataset_version_id}"
+        f" | baseline_rows={len(baseline_df)} | p99_secs={p99_secs}"
+    )
+    return baseline_df, p99_secs
+
+
 @task(name="build-drift-features", retries=0, tags=["features", "drift"])
 def build_drift_features(
     serving_cohort_df: pd.DataFrame,
@@ -190,11 +249,12 @@ def build_drift_features(
 @task(name="run-drift-check", retries=0, tags=["drift", "db"])
 def run_drift_check(
     current_df: pd.DataFrame,
+    baseline_df: pd.DataFrame,
     config: MonitoringConfig,
     scoring_date: date,
 ) -> dict:
     """
-    Load baseline features, compute PSI per feature, write 21 rows to monitoring_metrics.
+    Compute PSI per feature against baseline_df, write 21 rows to monitoring_metrics.
 
     Writes:
       - 20 rows: (scoring_date, "data_drift", "psi_{col}", psi_value, psi > threshold)
@@ -205,18 +265,9 @@ def run_drift_check(
         Dict with n_drifted_features (int) and drifted_features (list of str).
 
     Raises:
-        BaselineNotFoundError: If baseline_features.parquet does not exist.
         MonitoringMetricsWriteError: If the DB write fails (non-fatal at flow level).
     """
     logger = get_run_logger()
-
-    if not config.baseline_features_path.exists():
-        raise BaselineNotFoundError(
-            f"baseline_features.parquet not found at {config.baseline_features_path}. "
-            "Run the training pipeline to generate it."
-        )
-
-    baseline_df = pd.read_parquet(config.baseline_features_path)
 
     try:
         psi_scores = compute_feature_drift(baseline_df, current_df, list(FEATURE_COLS))
@@ -409,23 +460,27 @@ def compute_and_log_performance(
 @task(name="maybe-trigger-retraining", retries=0, tags=["retraining"])
 def maybe_trigger_retraining(perf_result: dict, trigger_retraining: bool) -> dict:
     """
-    Trigger the training pipeline if AUC-PR is below threshold and retraining is enabled.
+    Trigger dataset-build -> training -> validation if AUC-PR is below
+    threshold and retraining is enabled.
 
     Uses Option A (direct sub-flow call): Prefect 3.x supports calling @flow from
     inside @task, which creates a child flow run traceable in the Prefect UI.
+    run_retrain_and_validate_pipeline is a thin orchestrator over three
+    independent pipelines (build_dataset, train, validate) — each stays
+    separately invocable; this is just the common "auto-retrain" wiring.
 
     Args:
         perf_result:        Dict returned by compute_and_log_performance.
         trigger_retraining: False skips retraining regardless of alert state.
 
     Returns:
-        Dict with "triggered" bool and optional "train_result".
+        Dict with "triggered" bool and optional "retrain_result".
 
     Raises:
-        RetrainingTriggerError: If run_training_pipeline() raises (non-fatal at flow level).
+        RetrainingTriggerError: If run_retrain_and_validate_pipeline() raises (non-fatal at flow level).
     """
     # Import here to avoid circular import at module load time.
-    from pipelines.train import run_training_pipeline
+    from pipelines.retrain import run_retrain_and_validate_pipeline
 
     logger = get_run_logger()
 
@@ -438,15 +493,15 @@ def maybe_trigger_retraining(perf_result: dict, trigger_retraining: bool) -> dic
         return {"triggered": False}
 
     logger.warning(
-        f"maybe_trigger_retraining | AUC-PR alert active — triggering retraining"
+        f"maybe_trigger_retraining | AUC-PR alert active — triggering retrain-and-validate"
         f" | auc_pr={perf_result.get('auc_pr')}"
     )
     try:
-        train_result = run_training_pipeline(cohort_months=None, promote_if_better=True)
-        logger.info(f"maybe_trigger_retraining | training complete | result={train_result}")
-        return {"triggered": True, "train_result": train_result}
+        retrain_result = run_retrain_and_validate_pipeline(cohort_months=None)
+        logger.info(f"maybe_trigger_retraining | retrain-and-validate complete | result={retrain_result}")
+        return {"triggered": True, "retrain_result": retrain_result}
     except Exception as exc:
-        raise RetrainingTriggerError(f"run_training_pipeline() failed: {exc}") from exc
+        raise RetrainingTriggerError(f"run_retrain_and_validate_pipeline() failed: {exc}") from exc
 
 
 # ── Flow 1: Drift monitoring ──────────────────────────────────────────────────
@@ -461,7 +516,9 @@ def run_drift_monitoring(
     Track 1 monitoring: daily PSI-based feature drift detection.
 
     Compares the serving cohort's feature distribution for scoring_date against
-    the baseline_features.parquet saved at last training time.
+    the baseline features from the dataset-build run that trained whichever
+    model currently holds the production alias (fetched from MLflow, never a
+    local file — see resolve_production_dataset_version_id / load_baseline_and_p99).
 
     Args:
         scoring_date: Date to check predictions for (defaults to today).
@@ -498,8 +555,22 @@ def run_drift_monitoring(
 
     cohort_size = len(cohort_df)
 
-    # ── Step 2: Load p99_secs from frozen feature config ──────────────────────
-    p99_secs = load_feature_config(config.feature_config_path)["p99_secs"]
+    # ── Step 2: Resolve the dataset that trained the production model, ────────
+    #            then fetch baseline features + p99_secs from it (never local).
+    try:
+        dataset_version_id = resolve_production_dataset_version_id(config=config)
+    except BaselineNotFoundError as exc:
+        logger.error(f"run_drift_monitoring | baseline missing: {exc}")
+        _write_alert_metric(config, "data_drift", "baseline_missing", 1.0)
+        return {
+            "scoring_date":       str(target_date),
+            "cohort_size":        cohort_size,
+            "n_drifted_features": 0,
+            "drifted_features":   [],
+            "status":             "baseline_missing",
+        }
+
+    baseline_df, p99_secs = load_baseline_and_p99(dataset_version_id=dataset_version_id, config=config)
 
     # ── Step 3: Build current features ────────────────────────────────────────
     current_df = build_drift_features(
@@ -511,7 +582,7 @@ def run_drift_monitoring(
     drift_result: dict = {"n_drifted_features": 0, "drifted_features": []}
     try:
         drift_result = run_drift_check(
-            current_df=current_df, config=config, scoring_date=target_date
+            current_df=current_df, baseline_df=baseline_df, config=config, scoring_date=target_date
         )
     except BaselineNotFoundError as exc:
         logger.error(f"run_drift_monitoring | baseline missing: {exc}")
