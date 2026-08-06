@@ -1,9 +1,14 @@
 """
 Production monitoring pipeline — Track 1 (drift) and Track 2 (performance).
 
-Track 1 (run_drift_monitoring): Daily. Compares today's serving cohort feature
+Track 1 (run_drift_monitoring): Compares the day's serving cohort feature
     distribution against baseline training features using PSI. Writes 21 rows
-    to monitoring_metrics (20 per-feature PSI values + 1 summary).
+    to monitoring_metrics (20 per-feature PSI values + 1 summary). In the
+    common case it runs chained onto pipelines/serve.py's flow, reusing the
+    feature matrix serve.py already built (via the current_df parameter)
+    instead of rebuilding it. The standalone CLI invocation below still
+    rebuilds via build_features() — use it to backfill a historical date or
+    to re-run drift monitoring after a failed serving run.
 
 Track 2 (run_performance_monitoring): Monthly. Joins month M predictions with
     month M labels to compute AUC-PR, AUC-ROC, Precision@K, Recall@K. Writes
@@ -511,6 +516,7 @@ def run_drift_monitoring(
     scoring_date: date | None = None,
     data_source: str = "postgres",
     data_dir: str = "data/",
+    current_df: pd.DataFrame | None = None,
 ) -> dict:
     """
     Track 1 monitoring: daily PSI-based feature drift detection.
@@ -522,8 +528,18 @@ def run_drift_monitoring(
 
     Args:
         scoring_date: Date to check predictions for (defaults to today).
-        data_source:  "postgres" (default) or "csv" (dev only).
-        data_dir:     Relative path to CSV directory.
+        data_source:  "postgres" (default) or "csv" (dev only). Ignored when
+                      current_df is provided.
+        data_dir:     Relative path to CSV directory. Ignored when current_df
+                      is provided.
+        current_df:   Pre-built feature matrix (indexed by msno, FEATURE_COLS
+                      columns), typically handed in by serve.py right after it
+                      scores the same cohort — skips load_serving_cohort and
+                      build_drift_features entirely, avoiding a redundant
+                      rebuild of features the caller already has in memory.
+                      Leave None for the standalone CLI path (backfilling a
+                      historical date, or re-running after serve.py failed
+                      that day), which rebuilds via build_features() as before.
 
     Returns:
         Dict with keys: scoring_date, cohort_size, n_drifted_features,
@@ -537,23 +553,37 @@ def run_drift_monitoring(
     logger.info(
         f"run_drift_monitoring started"
         f" | scoring_date={target_date} | data_source={data_source}"
+        f" | current_df_provided={current_df is not None}"
     )
 
-    # ── Step 1: Load serving cohort ────────────────────────────────────────────
-    try:
-        cohort_df = load_serving_cohort(config=config, scoring_date=target_date)
-    except EmptyServingCohortError:
-        logger.warning(f"Empty serving cohort for scoring_date={target_date} — exiting early.")
-        _write_alert_metric(config, "data_drift", "cohort_size", 0.0)
-        return {
-            "scoring_date":       str(target_date),
-            "cohort_size":        0,
-            "n_drifted_features": 0,
-            "drifted_features":   [],
-            "status":             "empty_cohort",
-        }
-
-    cohort_size = len(cohort_df)
+    if current_df is not None:
+        # ── Chained path: reuse the feature matrix serve.py already built ────
+        if len(current_df) == 0:
+            logger.warning(f"Empty current_df for scoring_date={target_date} — exiting early.")
+            _write_alert_metric(config, "data_drift", "cohort_size", 0.0)
+            return {
+                "scoring_date":       str(target_date),
+                "cohort_size":        0,
+                "n_drifted_features": 0,
+                "drifted_features":   [],
+                "status":             "empty_cohort",
+            }
+        cohort_size = len(current_df)
+    else:
+        # ── Standalone path: load cohort, rebuild features from scratch ──────
+        try:
+            cohort_df = load_serving_cohort(config=config, scoring_date=target_date)
+        except EmptyServingCohortError:
+            logger.warning(f"Empty serving cohort for scoring_date={target_date} — exiting early.")
+            _write_alert_metric(config, "data_drift", "cohort_size", 0.0)
+            return {
+                "scoring_date":       str(target_date),
+                "cohort_size":        0,
+                "n_drifted_features": 0,
+                "drifted_features":   [],
+                "status":             "empty_cohort",
+            }
+        cohort_size = len(cohort_df)
 
     # ── Step 2: Resolve the dataset that trained the production model, ────────
     #            then fetch baseline features + p99_secs from it (never local).
@@ -572,10 +602,11 @@ def run_drift_monitoring(
 
     baseline_df, p99_secs = load_baseline_and_p99(dataset_version_id=dataset_version_id, config=config)
 
-    # ── Step 3: Build current features ────────────────────────────────────────
-    current_df = build_drift_features(
-        serving_cohort_df=cohort_df, config=config, p99_secs=p99_secs
-    )
+    # ── Step 3: Current features — reuse if provided, else build ─────────────
+    if current_df is None:
+        current_df = build_drift_features(
+            serving_cohort_df=cohort_df, config=config, p99_secs=p99_secs
+        )
 
     # ── Step 4: Compute PSI and write metrics ──────────────────────────────────
     status = "success"

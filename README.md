@@ -200,6 +200,45 @@ All three tracks write to the same `monitoring_metrics` PostgreSQL table. Grafan
 
 ---
 
+### Key Decision: Dataset Storage — MLflow Artifacts, Not DVC
+
+**Options considered:**
+
+| Option | Fit for the job | Setup cost | Operational overhead |
+|---|---|---|---|
+| DVC | Purpose-built: content-addressable hashing, dataset diffing, `dvc.yaml` dependency graph | ~Half a day — remote storage config, `.dvc` files | A second tool alongside MLflow, a second remote to manage |
+| MLflow artifacts (what I built) | Repurposed: not designed for datasets — no diffing, no dataset entity, no rollback workflow | Zero — same MLflow server already running | None — rides on the durable volume MLflow already needs |
+
+**Decision:** MLflow artifacts. `pipelines/build_dataset.py` logs `train.parquet` / `val.parquet` / `test.parquet` / `baseline_features.parquet` / `feature_config.json` to a dedicated `dataset_build` MLflow run; the run_id becomes `dataset_version_id`, tagged onto whatever model version the training pipeline fits from it.
+
+**Reasoning:** The actual requirement was narrow — a stable handle that two independent pipelines (training, validation) could agree on, with automatic lineage back to whichever model consumed it. MLflow's artifact store already satisfies that, and it's infrastructure this project needs regardless (model registry, experiment tracking). Standing up DVC would mean a second tool and a second remote for a requirement MLflow already covers at this scale — nothing here uses DVC's actual differentiators (content-hash diffing, checking out an old dataset).
+
+**Tradeoff being accepted:** This is a genuine misuse of MLflow's mental model. MLflow expects a "run" to produce metrics and a model; a `dataset_build` run produces neither — just files. Anyone browsing the MLflow UI sees a run with nothing trained, which is confusing without knowing the pattern.
+
+**What I'd do differently at scale:** Move dataset storage to DVC (or MLflow's own `mlflow.data` dataset-logging API, a smaller step closer to purpose-built) so datasets are versioned by content hash instead of "whatever run happened to log it," and so the `dataset_build` MLflow run doesn't have to double as a dataset registry it was never designed to be.
+
+---
+
+### Key Decision: Drift Monitoring Chained Onto Serving, Not Independent
+
+**Options considered:**
+
+| Option | Redundant compute | Independent scheduling | New moving parts |
+|---|---|---|---|
+| Keep fully independent (original design) | Yes — `monitor.py` rebuilds the same day's feature matrix `serve.py` already built | Yes — drift can run on its own schedule | None |
+| Persist a shared artifact (widen `predictions` with feature columns) | No | Yes | A DB migration + a read-or-rebuild fallback branch in `monitor.py` |
+| Chain as a direct subflow call (what I built) | No | No — drift now runs only when serving runs | None — reuses the existing subflow-call pattern `monitor.py` already uses for auto-retraining |
+
+**Decision:** Chain it. `run_serving_pipeline` calls `run_drift_monitoring(current_df=feature_df)` right after writing predictions, passing the feature matrix it already built in memory. `run_drift_monitoring` gained one optional parameter; when it's omitted, the standalone `monitor.py drift --date ...` CLI path is untouched and still rebuilds from source, which is what backfills and post-failure recovery use.
+
+**Reasoning:** Both pipelines were computing the identical `FEATURE_COLS` matrix for the identical cohort on the identical day — a genuine double-compute, not a deliberate independence tradeoff. The shared-artifact option would have fixed that too, but at the cost of a schema change and a permanent dual-path (read vs. rebuild) branch to maintain. The subflow call needed no new infrastructure and mirrors a pattern already established in this codebase (`monitor.py`'s `maybe_trigger_retraining` calling `run_retrain_and_validate_pipeline` the same way) — same tool for the same kind of problem.
+
+**Tradeoff being accepted:** Drift monitoring is no longer independently schedulable in the common case — it only runs when serving runs. If `serve.py` fails before reaching the drift step, that day's drift check doesn't happen automatically; there's no self-healing. Recovery is a manual `monitor.py drift --date <date>` call, the same operator action the 14-day (formerly 13-15) serving window now relies on instead of a rolling retry window.
+
+**What I'd do differently at scale:** Once there's an actual on-call/alerting story (paging on `pipeline_health` alerts in `monitoring_metrics`), reconsider whether losing independent drift scheduling is still the right trade — a system with reliable alerting can afford tighter coupling like this; one without it benefits more from redundant, self-healing pipelines even at extra compute cost.
+
+---
+
 ## Try It
 
 **Live Demo:** `[placeholder — replace with Railway URL after deployment]`

@@ -1,9 +1,13 @@
 """
 Daily batch scoring pipeline — Step 3.
 
-Fetches users whose subscription expires in 13-15 days, builds features
-via the shared feature module, scores with the production LightGBM model,
-and writes results to the PostgreSQL predictions table and a Parquet file.
+Fetches users whose subscription expires exactly 14 days from scoring_date,
+builds features via the shared feature module, scores with the production
+LightGBM model, and writes results to the PostgreSQL predictions table and
+a Parquet file. On success, also chains a drift-monitoring check
+(pipelines/monitor.py's run_drift_monitoring) using the feature matrix
+already built here, so that check doesn't recompute features from scratch.
+A missed scoring_date is not retried automatically — backfill with --date.
 
 Run locally (single execution):
     python src/serve.py
@@ -106,40 +110,40 @@ def _pg_conn(config: ServingConfig) -> Generator[psycopg2.extensions.connection,
 def fetch_expiring_cohort(
     config: ServingConfig,
     scoring_date: date,
-    window_days_min: int = 13,
-    window_days_max: int = 15,
+    lead_days: int = 14,
 ) -> pd.DataFrame:
     """
-    Query PostgreSQL for users whose membership_expire_date falls in
-    [scoring_date + window_days_min, scoring_date + window_days_max].
+    Query PostgreSQL for users whose membership_expire_date falls exactly
+    lead_days after scoring_date.
+
+    A missed day is not retried automatically — re-run with --date to
+    backfill a specific historical scoring_date.
 
     Returns a DataFrame with columns ["msno", "expiry_date"].
-    Returns an empty DataFrame if no users are in the window.
+    Returns an empty DataFrame if no users expire on that day.
     """
     logger = get_run_logger()
-    lo = scoring_date + timedelta(days=window_days_min)
-    hi = scoring_date + timedelta(days=window_days_max)
-    lo_int = int(lo.strftime("%Y%m%d"))
-    hi_int = int(hi.strftime("%Y%m%d"))
+    target = scoring_date + timedelta(days=lead_days)
+    target_int = int(target.strftime("%Y%m%d"))
 
     sql = """
         SELECT
             msno,
             TO_DATE(CAST(MAX(membership_expire_date) AS TEXT), 'YYYYMMDD') AS expiry_date
         FROM transactions
-        WHERE membership_expire_date BETWEEN %(lo)s AND %(hi)s
+        WHERE membership_expire_date = %(target)s
           AND membership_expire_date >= transaction_date
         GROUP BY msno
     """
     try:
         with _pg_conn(config) as conn:
-            df = pd.read_sql(sql, conn, params={"lo": lo_int, "hi": hi_int})
+            df = pd.read_sql(sql, conn, params={"target": target_int})
     except DatabaseConnectionError:
         raise
     except Exception as exc:
         raise CohortQueryError(f"Cohort query failed: {exc}") from exc
 
-    logger.info(f"fetch_expiring_cohort complete | cohort_size={len(df)} | window={lo}..{hi} | scoring_date={scoring_date}")
+    logger.info(f"fetch_expiring_cohort complete | cohort_size={len(df)} | target_expiry={target} | scoring_date={scoring_date}")
     return df
 
 
@@ -495,7 +499,9 @@ def run_serving_pipeline(
     Returns
     -------
     dict with keys: scoring_date, cohort_size, rows_written, model_version,
-                    parquet_path, status ("success" | "partial" | "failed")
+                    parquet_path, drift (chained run_drift_monitoring result,
+                    or None if the cohort was empty or the step failed),
+                    status ("success" | "partial" | "failed")
     """
     logger = get_run_logger()
     if scoring_date is None:
@@ -573,12 +579,28 @@ def run_serving_pipeline(
         logger.error(f"Health metrics write failed: {exc}")
         status = "partial"
 
+    # ── Step 9: Drift monitoring, chained (non-fatal) ─────────────────────────
+    # Passes the feature matrix already built above so run_drift_monitoring
+    # skips its own cohort load + rebuild. Failure here never affects the
+    # scores already written — this is a secondary check, not the primary
+    # deliverable. Backfill via `monitor.py drift --date <date>` if this step
+    # fails and drift needs checking for scoring_date after the fact.
+    drift_result: dict | None = None
+    try:
+        from pipelines.monitor import run_drift_monitoring
+
+        drift_result = run_drift_monitoring(scoring_date=scoring_date, current_df=feature_df)
+    except Exception as exc:
+        logger.error(f"Chained drift monitoring failed (non-fatal): {exc}")
+        status = "partial"
+
     result = {
         "scoring_date": str(scoring_date),
         "cohort_size": len(cohort_df),
         "rows_written": rows_written,
         "model_version": model_version,
         "parquet_path": parquet_path,
+        "drift": drift_result,
         "status": status,
     }
     logger.info(
