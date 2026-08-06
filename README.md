@@ -77,7 +77,7 @@ monitoring_metrics table → real-time visibility
 |---|---|---|
 | Source DB | PostgreSQL 16 on Docker | Handles 20M+ rows; indexed date-range queries |
 | Feature engineering | DuckDB (inside Python) | Queries CSVs + Postgres without loading into RAM |
-| Pipeline orchestration | Prefect | Python-native `@flow`/`@task`; zero infra for local dev vs Airflow's scheduler daemon |
+| Pipeline orchestration | Prefect | Python-native `@flow`/`@task`, simpler for solo local iteration than standing up Airflow's scheduler/webserver/metadata DB — trade-off below |
 | Experiment tracking | MLflow | Self-hosted, open source; covers tracking + registry + promotion in one tool |
 | Model | LightGBM | Native null handling, fast training, well-calibrated probabilities for risk tiers |
 | Prediction store | PostgreSQL table | Same instance as source; low write volume, simple queries |
@@ -236,6 +236,47 @@ All three tracks write to the same `monitoring_metrics` PostgreSQL table. Grafan
 **Tradeoff being accepted:** Drift monitoring is no longer independently schedulable in the common case — it only runs when serving runs. If `serve.py` fails before reaching the drift step, that day's drift check doesn't happen automatically; there's no self-healing. Recovery is a manual `monitor.py drift --date <date>` call, the same operator action the 14-day (formerly 13-15) serving window now relies on instead of a rolling retry window.
 
 **What I'd do differently at scale:** Once there's an actual on-call/alerting story (paging on `pipeline_health` alerts in `monitoring_metrics`), reconsider whether losing independent drift scheduling is still the right trade — a system with reliable alerting can afford tighter coupling like this; one without it benefits more from redundant, self-healing pipelines even at extra compute cost.
+
+---
+
+### Key Decision: Prefect Over Airflow
+
+**Options considered:**
+
+| Option | Local dev cost | Fit for backfill / date-partitioned runs | Ecosystem & recognizability |
+|---|---|---|---|
+| Airflow | Scheduler + webserver + metadata DB required just to run one DAG | Native — `execution_date`, catchup, and backfill are built-in scheduler concepts | Industry-standard; what most data platform teams run in production |
+| Prefect (what I built) | A plain Python function with `@flow`/`@task` decorators, runnable directly (`python serve.py --date ...`) | Hand-rolled — `scoring_date` param + `--date` CLI flag reimplement a slice of what Airflow gives for free | Smaller ecosystem; the API has changed substantially across major versions (1 → 2 → 3) |
+
+**Decision:** Prefect. Every pipeline (`build_dataset.py`, `train.py`, `validate.py`, `serve.py`, `monitor.py`, `retrain.py`) is a plain Python module decorated with `@flow`/`@task`, runnable directly with no scheduler daemon or metadata DB needed to execute it.
+
+**Reasoning:** For solo local development, not fighting Airflow's DAG-file/metadata-DB coupling just to test one pipeline change was worth more than Airflow's maturity. That said, this is a dev-ergonomics tradeoff, not a clean architectural win — it holds up less cleanly than "zero infra" makes it sound.
+
+**Tradeoff being accepted:**
+- **The infra saving is temporary, not structural.** It applies to local dev only. The moment these pipelines need to actually run on a schedule — the entire point of `serve.py`/`monitor.py` — Prefect needs a server, a worker, and deployment configs running somewhere, the same category of infra Airflow needs. That cost hasn't been paid yet because the pipelines are decorated but not actually scheduled (see Project Layout notes below).
+- **Airflow's core idiom is a better fit for what this project reimplements by hand.** `scoring_date` and the `--date` backfill flag are a hand-rolled version of `execution_date`/catchup/backfill — semantics Airflow's scheduler provides natively and has battle-tested for years.
+- **Ecosystem maturity and recognizability.** Airflow is what most data platform teams actually run, and its DAG API has stayed far more stable across major versions than Prefect's (Prefect 1 → 2 → 3 were near-total rewrites). For a project meant to be read by other engineers, that ubiquity carries real legibility value that Prefect's nicer local syntax doesn't offset.
+
+**What I'd do differently at scale:** Once real recurring scheduling with backfill/catchup semantics is actually needed — not just decorated-but-manual pipelines — re-evaluate Airflow specifically for its native `execution_date`/backfill model, which this project currently reimplements by hand. If Prefect stays, the honest next step is standing up its server/worker/deployment configs now, instead of continuing to treat "zero infra" as a permanent property of the choice rather than a deferred one.
+
+---
+
+### Key Decision: DuckDB Over Spark for Feature Aggregation
+
+**Options considered:**
+
+| Option | Fit for this data's scale | Setup cost | Operational overhead |
+|---|---|---|---|
+| Spark (PySpark) | Built for data that doesn't fit on one machine — distributed shuffle/partitioning | Cluster or local session, JVM dependency, serialization boundary between JVM and pandas | A cluster (or at minimum a JVM) to run and monitor, even for local dev |
+| DuckDB, embedded in-process (what I built) | Purpose-built for single-machine, columnar, vectorized OLAP on GBs, not TBs | Zero — `pip install duckdb`, `duckdb.connect()` inside the same Python process | None — lives and dies with the Python process; nothing separate to deploy or monitor |
+
+**Decision:** DuckDB, embedded directly inside `core/feature_module.py`. `build_features()` opens an in-process DuckDB connection, points views at either CSVs (`read_csv_auto`) or Postgres (via DuckDB's `postgres` extension/`ATTACH`), and runs three SQL aggregation queries — `_build_txn`, `_build_log`, `_build_member` — that join back into one feature matrix.
+
+**Reasoning:** The KKBox source tables are tens of millions of rows across `transactions`/`user_logs`/`members` — a few GB, comfortably single-machine. Spark's distributed shuffle/partition machinery solves a problem this dataset doesn't have; running it here would mean paying JVM startup and serialization overhead (or standing up a whole cluster) for aggregations DuckDB's vectorized columnar engine does faster in-process, with no serialization boundary between the query engine and pandas, and no separate service to deploy alongside Prefect and Postgres. The aggregation logic itself — window functions, `GROUP BY`, `LEFT JOIN`s — is dbt's philosophy (let SQL do the transform work) without dbt's tooling: it's called as a plain Python function, not compiled and materialized against a warehouse, because there's no warehouse here to model against — just CSVs and one Postgres instance DuckDB can query directly.
+
+**Tradeoff being accepted:** No distributed scale-out path — if the source tables grew past what fits comfortably on one machine's memory/disk, DuckDB's single-node model needs re-architecting, not a config change. No dbt-style model versioning, testing, or lineage graph either; the SQL lives inside Python functions (`_build_txn` etc.), not as tracked, independently-run `.sql` model files.
+
+**What I'd do differently at scale:** If raw event volume grew by 10-100x (billions of rows, multi-TB), move the aggregation to Spark or a warehouse-native transform layer (Snowflake/BigQuery + dbt), and let DuckDB's role shrink back to what it's actually built for — fast local/single-node analytics. At this dataset's actual size, making that move now would add operational cost for a scale problem that doesn't exist yet.
 
 ---
 
