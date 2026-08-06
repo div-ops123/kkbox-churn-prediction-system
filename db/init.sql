@@ -83,7 +83,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_pred_msno_scoring
 
 -- ── Monitoring metrics store ──────────────────────────────────────────────────
 -- Written by all three monitoring tracks (data_drift, model_perf, pipeline_health).
--- Read by Grafana via the built-in PostgreSQL data source.
+-- Read by maybe_trigger_retraining() to decide whether to kick off retrain.py;
+-- otherwise queried directly via SQL — no dashboard layer on top of it.
 
 CREATE TABLE IF NOT EXISTS monitoring_metrics (
     id              BIGSERIAL   PRIMARY KEY,

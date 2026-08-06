@@ -67,8 +67,9 @@ Track 2 — Model performance (monthly, AUC-PR vs threshold)
 Track 3 — Pipeline health (cohort size, null rates)
         │
         ▼
-GRAFANA DASHBOARD
-monitoring_metrics table → real-time visibility
+MONITORING METRICS STORE (PG)
+monitoring_metrics table — feeds the auto-retraining trigger,
+queryable directly via SQL
 ```
 
 ### Tech Stack
@@ -82,25 +83,40 @@ monitoring_metrics table → real-time visibility
 | Model | LightGBM | Native null handling, fast training, well-calibrated probabilities for risk tiers |
 | Prediction store | PostgreSQL table | Same instance as source; low write volume, simple queries |
 | Drift monitoring | Custom PSI (no Evidently) | Full control over bin-edge anchoring and alert logic |
-| Dashboard | Grafana | Reads PostgreSQL directly; no Prometheus, no extra infra |
 | Score API | FastAPI + Uvicorn | Async, auto OpenAPI docs, sub-200ms reads from indexed table |
 | Containerization | Docker Compose | Single-command local and cloud deploy |
+
+### Key Features
+
+- **Leakage-safe feature engineering** — `feature_cutoff_dt = expire_date - 14 days` is enforced *inside* `build_features()`, not left to the caller, so training and serving can't accidentally see post-cutoff data.
+- **Zero train/serve skew** — training, serving, and drift monitoring all call the same `core/feature_module.py` function; there is no second implementation to drift out of sync.
+- **Automatic retraining trigger** — `monitor.py`'s performance track calls `retrain.py` as a direct sub-flow when monthly AUC-PR drops below threshold, no manual intervention required.
+- **Drift-aware, not just accuracy-aware monitoring** — PSI per feature against a training-time baseline, anchored bin edges, distinguishes real model degradation from expected structural drift (see the March 2017 log-coverage example below).
 
 ---
 
 ## The Results
+
+**Technical metrics:**
 
 | Metric | Value |
 |---|---|
 | AUC-PR (production cohort, March 2017) | **0.977** |
 | AUC-ROC | 0.997 |
 | Precision@100 | ~0.97 |
-| Training cohort size | ~35K verified-anchor users |
-| Serving cohort size (single date) | ~2,977 users |
 | Features engineered | 20 (transaction, log, member) |
 | Feature training-serving skew | **Zero** — single shared module |
+
+**Business-relevant metrics:**
+
+| Metric | Value |
+|---|---|
+| Training cohort size | ~35K verified-anchor users |
+| Serving cohort size (single date, actionable by CRM) | ~2,977 users |
 | Pipelines with retry/alerting | All 4 (label, train, serve, monitor) |
 | API endpoints | 3 (`/health`, `/score/{user_id}`, `/cohort`) |
+
+**User testimonials:** None yet — this is a pre-launch portfolio project, not a deployed product with users. The honest equivalent at this stage is the monitoring output below: proof the system correctly distinguishes real problems from noise, which is what a CRM team would actually need to trust before acting on its output.
 
 **Monitoring output (2017-03-01 drift run):**
 - 5 of 20 features triggered PSI > 0.2 alerts — all log-based features
@@ -130,25 +146,6 @@ LightGBM with `scale_pos_weight=10.1` to handle the 8.99% churn class imbalance.
 
 The `p99_secs` winsorization threshold (43,805 sec/day) is computed once from the training distribution and saved to `models/feature_config.json`. The serving pipeline loads this frozen value — recomputing from the serving distribution would silently change the feature scale as listening patterns drift.
 
-### Deployment Setup
-
-```
-docker compose up -d     # PostgreSQL :5433, MLflow :5000, Grafana :3000
-
-# One-time seed
-python db/seed.py
-
-# Monthly pipeline cycle
-python src/pipelines/label.py --cohort-month 2017-03
-python src/pipelines/train.py --cohort-months 2017-03
-python src/pipelines/serve.py --date 2017-03-01
-python src/pipelines/monitor.py drift --date 2017-03-01
-python src/pipelines/monitor.py performance --cohort-month 2017-03
-
-# Score API
-uvicorn src.api.main:app --reload --port 8000
-```
-
 ### Monitoring Strategy
 
 Three independent tracks in `src/pipelines/monitor.py`, each with its own failure domain:
@@ -159,11 +156,26 @@ Three independent tracks in `src/pipelines/monitor.py`, each with its own failur
 
 **Track 3 — Pipeline health (inline):** Cohort size, null rates, and run status written to `monitoring_metrics` by each pipeline at execution time. Alert threshold: cohort_size < 100.
 
-All three tracks write to the same `monitoring_metrics` PostgreSQL table. Grafana reads it directly.
+All three tracks write to the same `monitoring_metrics` PostgreSQL table — the audit trail every metric this system has ever computed, and what `maybe_trigger_retraining` reads to decide whether to kick off `retrain.py`. Queryable directly via SQL; no dashboard layer on top of it.
 
 ---
 
 ## Learnings & Trade-offs
+
+**What worked:**
+- The shared feature module (`core/feature_module.py`) eliminated train/serve skew outright — not "monitored for," actually structurally impossible, since there's only one implementation to diverge from.
+- Chaining drift monitoring onto serving (passing the in-memory feature matrix instead of rebuilding it) removed a genuine double-compute with zero new infrastructure.
+- The custom 40-line PSI implementation was faster to get exactly right — anchored bin edges — than configuring Evidently to do the same thing.
+
+**What didn't / what's still missing:**
+- The app itself isn't containerized — Docker Compose runs the infra (Postgres, MLflow), but the pipelines and API still run as bare `python`/`uvicorn` processes on the host. That's inconsistent: if infra is containerized for reproducibility, the app driving it should be too.
+- Prefect pipelines are decorated (`@flow`/`@task`) but not actually deployed on a schedule — "daily serving" and "monthly training" are manual invocations today, not live automation. See the Prefect vs. Airflow trade-off below for why that gap exists.
+- No live deployment. There's no URL to hit directly — reproducing this requires cloning the repo and standing up the stack locally, which is a real gap for anyone trying to evaluate it quickly.
+
+**What I'd do differently:**
+- Containerize the app (pipelines + API) alongside the infra services, so `docker compose up` is the entire reproduction story instead of "start infra, then remember to run five Python commands by hand."
+- Deploy the Score API and a scheduled `serve.py` run to a low-cost host (Railway/Fly.io) so there's a real, live endpoint to hit — even a slow one — instead of asking a reviewer to take the metrics on faith.
+- Stand up an actual Prefect worker/deployment now, since "zero infra for local dev" (see below) was never meant to substitute permanently for real scheduling.
 
 ### Key Decision: Feature Consistency Mechanism
 
@@ -333,17 +345,7 @@ OpenAPI docs: `http://localhost:8000/docs`
 
 | Dashboard | URL | Credentials |
 |---|---|---|
-| Grafana monitoring | http://localhost:3000 | admin / admin |
 | MLflow experiments | http://localhost:5000 | — |
-
-
-# What's missing that will hurt you:
-1. No Docker container for the app itself. q: why do i have to containerize the app?
-2. Prefect pipelines not actually running — they're decorated but manual.
-3. No live URL. This means you can't show a founder "here, hit this endpoint right now." That's a gap.
-
-
-
 
 ### Project Layout
 
