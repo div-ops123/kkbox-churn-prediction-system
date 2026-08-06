@@ -101,7 +101,7 @@ Two tracks, deliberately kept structurally different — see Design Decisions Lo
 
 **Track 2 — Model Performance** (no transform stage at all — it joins already-scored data, it never calls the feature module). Runs monthly. Joins the prediction store (month M-1 predictions) with the label store (month M-1 actuals). Computes AUC-PR, AUC-ROC, Precision@K, Recall@K. Compares against a baseline threshold. If AUC-PR falls below threshold, triggers the **retrain orchestrator** — not the training pipeline directly (see Design Decisions Locked).
 
-**Track 3 — Pipeline Health** (handled inline by every pipeline, not a separate flow). Cohort size anomaly detection, missing data checks, feature null rate checks. Each of `serve.py`, `label.py`, `build_dataset.py`, `train.py`, and `validate.py` writes its own health rows to `monitoring_metrics`.
+**Track 3 — Pipeline Health** (handled inline by every pipeline, not a separate flow). Cohort size anomaly detection, missing data checks, feature null rate checks. Each of `serve.py`, `label.py`, `build_dataset.py`, `train.py`, and `validate.py` computes and logs its own health metrics inline — console output only, no persistence.
 
 Output: metrics log (every run), alert if drift or degradation threshold breached, retraining trigger if AUC-PR < defined threshold.
 
@@ -167,7 +167,7 @@ RAW TABLES
 
 **2. Training never decides promotion.** The dataset-build pipeline holds out the most recent labeled month as a test set the training pipeline never sees — not for fitting, not for early stopping. Training always registers a new model version and stops there; it never compares against production and never sets an alias. Only the validation pipeline, scoring on that untouched test fold, decides whether a candidate becomes `challenger`. This closes a real gap in the original single-pipeline design: comparing production against a candidate on the same fold the candidate's early stopping had already used gave the candidate a structural advantage in the comparison. Promoting `challenger` to `production` is a further, deliberately out-of-scope decision — it belongs to a deployment strategy (canary, shadow mode, etc.) not designed here.
 
-**3. Dataset artifacts live in MLflow, not local disk.** `feature_config.json` and the drift baseline used to be written to `models/` on local disk, read back by whichever pipeline needed them next. `docker-compose.yml` mounts durable volumes for Postgres, MLflow, and Grafana, but nothing for `models/` — a redeploy between training and the next drift check would silently wipe them. Worse, the file was overwritten on every training run regardless of promotion, so an unpromoted candidate could silently change what serving used. Both are fixed by tagging every model version with the `dataset_version_id` it was trained on and having callers fetch `p99_secs`/baseline from that dataset's MLflow artifacts — durability comes from MLflow's already-durable artifact store, and staleness is fixed because callers always resolve the artifact through *the currently-aliased model*, never "whatever was last written."
+**3. Dataset artifacts live in MLflow, not local disk.** `feature_config.json` and the drift baseline used to be written to `models/` on local disk, read back by whichever pipeline needed them next. `docker-compose.yml` mounts durable volumes for Postgres and MLflow, but nothing for `models/` — a redeploy between training and the next drift check would silently wipe them. Worse, the file was overwritten on every training run regardless of promotion, so an unpromoted candidate could silently change what serving used. Both are fixed by tagging every model version with the `dataset_version_id` it was trained on and having callers fetch `p99_secs`/baseline from that dataset's MLflow artifacts — durability comes from MLflow's already-durable artifact store, and staleness is fixed because callers always resolve the artifact through *the currently-aliased model*, never "whatever was last written."
 
 ---
 
@@ -240,17 +240,11 @@ labels table:
 
 ---
 
-### **Monitoring Metrics Store — PostgreSQL table \+ Grafana**
+### **Monitoring output — logged, not persisted**
 
-**What:** A `monitoring_metrics` table in PostgreSQL. Grafana reads from it.
+**What:** Every pipeline computes its own metrics (drift PSI, performance AUC-PR/precision/recall, pipeline health cohort size/null rates) and logs them via the Prefect run logger. There is no metrics table and no dashboard — a `monitoring_metrics` PostgreSQL table and a Grafana dashboard on top of it were removed after review found nothing (no automated trigger, no dashboard, no manual query) ever read either back. The retraining trigger in `monitor.py` acts on the in-memory result of the same flow run, not a re-query of anything persisted.
 
-run\_date, pipeline\_type, metric\_name, metric\_value, alert\_triggered
-
-`pipeline_type` now spans six values — `labeling`, `dataset_build`, `training`, `validation`, `pipeline_health` (serving), `data_drift` and `model_perf` (monitoring) — with no schema change required to add the new dataset-build and validation pipelines.
-
-Grafana connects to PostgreSQL directly via its built-in PostgreSQL data source plugin. No Prometheus needed. No separate time-series database. Simple queries, visible dashboards, free.
-
-**Drift detection library:** Evidently AI. Open source, Python-native, produces feature drift reports and data quality reports that you can parse programmatically and log to your metrics table.
+**Drift detection library:** Evidently AI. Open source, Python-native, produces feature drift reports and data quality reports that you can parse programmatically and log.
 
 ---
 
@@ -279,8 +273,7 @@ containers:
   \- kkbox\_postgres          (database)  
   \- kkbox\_mlflow            (tracking server + artifact store — now also holds dataset snapshots)  
   \- kkbox\_api               (FastAPI score API)  
-  \- kkbox\_prefect\_worker    (runs all pipeline flows)  
-  \- kkbox\_grafana           (dashboard)
+  \- kkbox\_prefect\_worker    (runs all pipeline flows)
 
 ---
 
@@ -320,9 +313,8 @@ containers:
 | Experiment tracking | MLflow | Open source, self-hosted, versioning \+ registry \+ dataset lineage |
 | Model | LightGBM | Best prior for tabular churn, fast, handles nulls |
 | Prediction \+ label store | PostgreSQL tables | Same instance, low volume, simple queries |
-| Monitoring metrics store | PostgreSQL \+ Evidently | Simple, Grafana-compatible, no extra infra |
+| Monitoring output | Logged via Prefect run output | No persisted store — nothing ever read one back |
 | Drift \+ perf monitoring | Evidently AI | Python-native, open source drift reports |
-| Dashboard | Grafana | Reads PostgreSQL directly, free |
 | Score API | FastAPI \+ Uvicorn | Async, fast, minimal boilerplate |
 | Containerization | Docker \+ Compose | Environment consistency, single-command deploy |
 | Deployment | Railway free tier | Fast setup, persistent VM, GitHub integration |

@@ -31,14 +31,12 @@ import logging
 import sys
 import tempfile
 from contextlib import contextmanager
-from datetime import date
 from pathlib import Path
 from typing import Generator
 
 import mlflow
 import pandas as pd
 import psycopg2
-import psycopg2.extras
 from prefect import flow, get_run_logger, task
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -62,9 +60,6 @@ class FeatureBuildError(Exception):
 
 class DatasetRegistrationError(Exception):
     """MLflow logging of the dataset artifacts failed."""
-
-class DatasetMetricsWriteError(Exception):
-    """Write to monitoring_metrics failed — non-fatal."""
 
 
 # ── DB context manager ────────────────────────────────────────────────────────
@@ -253,60 +248,14 @@ def split_and_persist_dataset(
     }
 
 
-@task(name="write-dataset-metrics", retries=1, retry_delay_seconds=30, tags=["db", "monitoring"])
-def write_dataset_metrics(dataset_result: dict, config: DatasetBuildConfig) -> None:
-    """
-    Write dataset-build pipeline health metrics to monitoring_metrics.
-
-    Non-fatal: raises DatasetMetricsWriteError on failure; the flow catches
-    it, logs WARNING, and continues with status="partial".
-    """
+@task(name="log-dataset-metrics", retries=0, tags=["monitoring"])
+def log_dataset_metrics(dataset_result: dict) -> None:
+    """Log dataset-build health metrics (n_train/n_val/n_test) — console output only."""
     logger = get_run_logger()
-    run_date = date.today()
-
-    metrics = [
-        ("n_train", float(dataset_result["n_train"]), False),
-        ("n_val",   float(dataset_result["n_val"]),   False),
-        ("n_test",  float(dataset_result["n_test"]),  False),
-    ]
-    rows = [
-        (run_date, "dataset_build", name, value, alert)
-        for name, value, alert in metrics
-    ]
-
-    sql = """
-        INSERT INTO monitoring_metrics
-            (run_date, pipeline_type, metric_name, metric_value, alert_triggered)
-        VALUES %s
-    """
-    try:
-        with _pg_conn(config) as conn:
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(cur, sql, rows)
-            conn.commit()
-    except DatasetConfigError:
-        raise
-    except Exception as exc:
-        raise DatasetMetricsWriteError(f"Failed to write dataset metrics: {exc}") from exc
-
-    logger.info(f"write_dataset_metrics complete | metrics_written={len(metrics)}")
-
-
-def _write_empty_cohort_metric(config: DatasetBuildConfig) -> None:
-    """Write a single monitoring row when the labels table returns no rows. Non-fatal."""
-    sql = """
-        INSERT INTO monitoring_metrics
-            (run_date, pipeline_type, metric_name, metric_value, alert_triggered)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT DO NOTHING
-    """
-    try:
-        with _pg_conn(config) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, (date.today(), "dataset_build", "cohort_size", 0.0, True))
-            conn.commit()
-    except Exception:
-        pass  # non-fatal; don't mask the empty-cohort early-exit path
+    logger.info(
+        f"log_dataset_metrics | n_train={dataset_result['n_train']}"
+        f" | n_val={dataset_result['n_val']} | n_test={dataset_result['n_test']}"
+    )
 
 
 # ── Prefect flow ──────────────────────────────────────────────────────────────
@@ -336,7 +285,7 @@ def run_dataset_build_pipeline(
     Returns
     -------
     dict with keys: status, dataset_version_id, n_train, n_val, n_test.
-    status is "built", "partial" (metrics write failed), or "empty_cohort".
+    status is "built" or "empty_cohort".
     """
     logger = get_run_logger()
     config = load_dataset_build_config(
@@ -356,7 +305,6 @@ def run_dataset_build_pipeline(
 
     if len(cohort_df) == 0:
         logger.warning("Empty label cohort — no rows found. Exiting early.")
-        _write_empty_cohort_metric(config)
         return {
             "status": "empty_cohort",
             "dataset_version_id": None,
@@ -373,15 +321,10 @@ def run_dataset_build_pipeline(
         features_df=features_df, p99_secs=p99_secs, config=config
     )
 
-    # ── Step 4: Health metrics (non-fatal) ────────────────────────────────────
-    status = "built"
-    try:
-        write_dataset_metrics(dataset_result=dataset_result, config=config)
-    except DatasetMetricsWriteError as exc:
-        logger.error(f"Dataset metrics write failed (non-fatal): {exc}")
-        status = "partial"
+    # ── Step 4: Health metrics (logged only) ──────────────────────────────────
+    log_dataset_metrics(dataset_result=dataset_result)
 
-    result = {"status": status, **dataset_result}
+    result = {"status": "built", **dataset_result}
     logger.info(
         f"run_dataset_build_pipeline complete"
         f" | status={result['status']}"

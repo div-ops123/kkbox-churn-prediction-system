@@ -70,11 +70,6 @@ INDEXES = [
     # label store
     ("idx_labels_labeled_date",
      "CREATE INDEX IF NOT EXISTS idx_labels_labeled_date ON labels(labeled_date)"),
-    # monitoring metrics
-    ("idx_mon_run_date",
-     "CREATE INDEX IF NOT EXISTS idx_mon_run_date ON monitoring_metrics(run_date)"),
-    ("idx_mon_pipeline",
-     "CREATE INDEX IF NOT EXISTS idx_mon_pipeline ON monitoring_metrics(pipeline_type, run_date)"),
 ]
 
 SEP = "-" * 60

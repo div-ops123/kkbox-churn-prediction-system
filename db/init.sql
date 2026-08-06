@@ -80,18 +80,3 @@ CREATE TABLE IF NOT EXISTS predictions (
 -- Prevents duplicate rows if the batch job retries on the same day.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pred_msno_scoring
     ON predictions (msno, scoring_date);
-
--- ── Monitoring metrics store ──────────────────────────────────────────────────
--- Written by all three monitoring tracks (data_drift, model_perf, pipeline_health).
--- Read by maybe_trigger_retraining() to decide whether to kick off retrain.py;
--- otherwise queried directly via SQL — no dashboard layer on top of it.
-
-CREATE TABLE IF NOT EXISTS monitoring_metrics (
-    id              BIGSERIAL   PRIMARY KEY,
-    run_date        DATE        NOT NULL,
-    pipeline_type   VARCHAR(20) NOT NULL,      -- 'data_drift'|'model_perf'|'pipeline_health'
-    metric_name     VARCHAR(50) NOT NULL,
-    metric_value    REAL,
-    alert_triggered BOOLEAN     NOT NULL DEFAULT FALSE,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);

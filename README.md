@@ -67,9 +67,9 @@ Track 2 — Model performance (monthly, AUC-PR vs threshold)
 Track 3 — Pipeline health (cohort size, null rates)
         │
         ▼
-MONITORING METRICS STORE (PG)
-monitoring_metrics table — feeds the auto-retraining trigger,
-queryable directly via SQL
+Logged via Prefect run output — no persistence layer.
+The retraining trigger below acts on the in-memory
+perf dict from this same run, not a re-query of anything.
 ```
 
 ### Tech Stack
@@ -154,9 +154,9 @@ Three independent tracks in `src/pipelines/monitor.py`, each with its own failur
 
 **Track 2 — Performance (monthly):** Join month-M predictions with month-M labels on `msno`. Compute AUC-PR, AUC-ROC, Precision@100, Recall@100. Alert threshold: AUC-PR < 0.45 triggers automatic retraining via sub-flow call.
 
-**Track 3 — Pipeline health (inline):** Cohort size, null rates, and run status written to `monitoring_metrics` by each pipeline at execution time. Alert threshold: cohort_size < 100.
+**Track 3 — Pipeline health (inline):** Cohort size, null rates, and run status computed and logged by each pipeline at execution time. Alert threshold: cohort_size < 100.
 
-All three tracks write to the same `monitoring_metrics` PostgreSQL table — the audit trail every metric this system has ever computed, and what `maybe_trigger_retraining` reads to decide whether to kick off `retrain.py`. Queryable directly via SQL; no dashboard layer on top of it.
+All three tracks log to the Prefect run output only — nothing is persisted. `maybe_trigger_retraining` acts on the in-memory perf dict `compute_and_log_performance` returns within that same flow run, not a re-query of any store. A `monitoring_metrics` table used to sit here; it was removed since nothing — no dashboard, no automated trigger, no manual query — ever read it back. Logging what's already computed costs nothing extra; a table nothing queries is dead weight.
 
 ---
 
@@ -247,7 +247,7 @@ All three tracks write to the same `monitoring_metrics` PostgreSQL table — the
 
 **Tradeoff being accepted:** Drift monitoring is no longer independently schedulable in the common case — it only runs when serving runs. If `serve.py` fails before reaching the drift step, that day's drift check doesn't happen automatically; there's no self-healing. Recovery is a manual `monitor.py drift --date <date>` call, the same operator action the 14-day (formerly 13-15) serving window now relies on instead of a rolling retry window.
 
-**What I'd do differently at scale:** Once there's an actual on-call/alerting story (paging on `pipeline_health` alerts in `monitoring_metrics`), reconsider whether losing independent drift scheduling is still the right trade — a system with reliable alerting can afford tighter coupling like this; one without it benefits more from redundant, self-healing pipelines even at extra compute cost.
+**What I'd do differently at scale:** Once there's an actual on-call/alerting story — which would need a real metrics sink wired to a pager, not the removed `monitoring_metrics` table, which nothing ever read — reconsider whether losing independent drift scheduling is still the right trade. A system with reliable alerting can afford tighter coupling like this; one without it benefits more from redundant, self-healing pipelines even at extra compute cost.
 
 ---
 

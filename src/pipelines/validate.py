@@ -27,16 +27,11 @@ from __future__ import annotations
 import logging
 import sys
 import tempfile
-from contextlib import contextmanager
-from datetime import date
 from pathlib import Path
-from typing import Generator
 
 import mlflow
 import mlflow.lightgbm
 import pandas as pd
-import psycopg2
-import psycopg2.extras
 from mlflow import MlflowClient
 from prefect import flow, get_run_logger, task
 
@@ -51,9 +46,6 @@ from core.model_trainer import evaluate_on_holdout
 
 # ── Custom exceptions ──────────────────────────────────────────────────────────
 
-class ValidationConfigError(Exception):
-    """PostgreSQL connection failed or config is invalid."""
-
 class TestSetLoadError(Exception):
     """Failed to fetch test.parquet for dataset_version_id."""
 
@@ -65,24 +57,6 @@ class EvaluationError(Exception):
 
 class ChallengerAliasError(Exception):
     """Failed to set the 'challenger' alias in MLflow."""
-
-class ValidationMetricsWriteError(Exception):
-    """Write to monitoring_metrics failed — non-fatal."""
-
-
-# ── DB context manager ────────────────────────────────────────────────────────
-
-@contextmanager
-def _pg_conn(config: ValidationConfig) -> Generator[psycopg2.extensions.connection, None, None]:
-    conn = None
-    try:
-        conn = psycopg2.connect(config.postgres.dsn)
-        yield conn
-    except psycopg2.OperationalError as exc:
-        raise ValidationConfigError(f"Cannot connect to PostgreSQL: {exc}") from exc
-    finally:
-        if conn is not None:
-            conn.close()
 
 
 # ── Prefect tasks ─────────────────────────────────────────────────────────────
@@ -230,55 +204,28 @@ def promote_to_challenger(candidate_version: str, should_promote: bool, config: 
     logger.info(f"promote_to_challenger complete | version={candidate_version} | alias=challenger")
 
 
-@task(name="write-validation-metrics", retries=1, retry_delay_seconds=30, tags=["db", "monitoring"])
-def write_validation_metrics(
+@task(name="log-validation-metrics", retries=0, tags=["monitoring"])
+def log_validation_metrics(
     candidate_version: str,
     candidate_metrics: dict,
     production_metrics: dict | None,
     promoted: bool,
-    config: ValidationConfig,
 ) -> None:
-    """
-    Write validation pipeline results to the monitoring_metrics table.
-
-    Non-fatal: raises ValidationMetricsWriteError on failure; the flow
-    catches it, logs WARNING, and continues with status="partial".
-    """
+    """Log validation results — console output only."""
     logger = get_run_logger()
-    run_date = date.today()
     prod_auc_pr = production_metrics["val_auc_pr"] if production_metrics else 0.0
 
     metrics = [
-        ("test_auc_pr_candidate",   candidate_metrics["val_auc_pr"],   False),
-        ("test_auc_roc_candidate",  candidate_metrics["val_auc_roc"],  False),
+        ("test_auc_pr_candidate",    candidate_metrics["val_auc_pr"],     False),
+        ("test_auc_roc_candidate",   candidate_metrics["val_auc_roc"],    False),
         ("precision_at_k_candidate", candidate_metrics["precision_at_k"], False),
-        ("recall_at_k_candidate",   candidate_metrics["recall_at_k"],  False),
-        ("test_auc_pr_production",  prod_auc_pr,                       False),
-        ("promoted_to_challenger",  float(int(promoted)),              False),
+        ("recall_at_k_candidate",    candidate_metrics["recall_at_k"],    False),
+        ("test_auc_pr_production",   prod_auc_pr,                         False),
+        ("promoted_to_challenger",   float(int(promoted)),                False),
     ]
-
-    rows = [
-        (run_date, "validation", name, value, alert)
-        for name, value, alert in metrics
-    ]
-
-    sql = """
-        INSERT INTO monitoring_metrics
-            (run_date, pipeline_type, metric_name, metric_value, alert_triggered)
-        VALUES %s
-    """
-    try:
-        with _pg_conn(config) as conn:
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(cur, sql, rows)
-            conn.commit()
-    except ValidationConfigError:
-        raise
-    except Exception as exc:
-        raise ValidationMetricsWriteError(f"Failed to write validation metrics: {exc}") from exc
 
     logger.info(
-        f"write_validation_metrics complete | metrics_written={len(metrics)}"
+        f"log_validation_metrics complete | metrics={metrics}"
         f" | candidate_version={candidate_version} | promoted={promoted}"
     )
 
@@ -307,7 +254,7 @@ def run_validation_pipeline(dataset_version_id: str, candidate_version: str) -> 
     -------
     dict with keys: status, candidate_version, test_auc_pr_candidate,
     test_auc_pr_production, promoted.
-    status is "challenger", "not_promoted", or "partial" (metrics write failed).
+    status is "challenger" or "not_promoted".
     """
     logger = get_run_logger()
     config = load_validation_config()
@@ -331,22 +278,16 @@ def run_validation_pipeline(dataset_version_id: str, candidate_version: str) -> 
     # ── Step 3: Promote to challenger (never touches production) ─────────────
     promote_to_challenger(candidate_version=candidate_version, should_promote=should_promote, config=config)
 
-    # ── Step 4: Health metrics (non-fatal) ────────────────────────────────────
-    status = "challenger" if should_promote else "not_promoted"
-    try:
-        write_validation_metrics(
-            candidate_version=candidate_version,
-            candidate_metrics=candidate_metrics,
-            production_metrics=production_metrics,
-            promoted=should_promote,
-            config=config,
-        )
-    except ValidationMetricsWriteError as exc:
-        logger.error(f"Validation metrics write failed (non-fatal): {exc}")
-        status = "partial"
+    # ── Step 4: Health metrics (logged only) ──────────────────────────────────
+    log_validation_metrics(
+        candidate_version=candidate_version,
+        candidate_metrics=candidate_metrics,
+        production_metrics=production_metrics,
+        promoted=should_promote,
+    )
 
     result = {
-        "status": status,
+        "status": "challenger" if should_promote else "not_promoted",
         "candidate_version": candidate_version,
         "test_auc_pr_candidate": round(candidate_metrics["val_auc_pr"], 4),
         "test_auc_pr_production": round(production_metrics["val_auc_pr"], 4) if production_metrics else None,

@@ -29,16 +29,11 @@ from __future__ import annotations
 import logging
 import sys
 import tempfile
-from contextlib import contextmanager
-from datetime import date
 from pathlib import Path
-from typing import Generator
 
 import mlflow
 import mlflow.lightgbm
 import pandas as pd
-import psycopg2
-import psycopg2.extras
 from mlflow import MlflowClient
 from prefect import flow, get_run_logger, task
 
@@ -51,9 +46,6 @@ from core.model_trainer import TrainArtifact, _auto_scale_pos_weight, train_lgbm
 
 # ── Custom exceptions ──────────────────────────────────────────────────────────
 
-class TrainingConfigError(Exception):
-    """PostgreSQL connection failed or config is invalid."""
-
 class DatasetLoadError(Exception):
     """Failed to fetch the dataset-build artifacts for dataset_version_id."""
 
@@ -62,24 +54,6 @@ class ModelTrainingError(Exception):
 
 class MLflowRegistrationError(Exception):
     """MLflow logging or model registration failed."""
-
-class TrainingMetricsWriteError(Exception):
-    """Write to monitoring_metrics failed — non-fatal."""
-
-
-# ── DB context manager ────────────────────────────────────────────────────────
-
-@contextmanager
-def _pg_conn(config: TrainingConfig) -> Generator[psycopg2.extensions.connection, None, None]:
-    conn = None
-    try:
-        conn = psycopg2.connect(config.postgres.dsn)
-        yield conn
-    except psycopg2.OperationalError as exc:
-        raise TrainingConfigError(f"Cannot connect to PostgreSQL: {exc}") from exc
-    finally:
-        if conn is not None:
-            conn.close()
 
 
 # ── Prefect tasks ─────────────────────────────────────────────────────────────
@@ -224,62 +198,25 @@ def register_to_mlflow(
     return run_id, mv.version
 
 
-@task(name="write-training-metrics", retries=1, retry_delay_seconds=30, tags=["db", "monitoring"])
-def write_training_metrics(
-    candidate: TrainArtifact,
-    run_id: str,
-    config: TrainingConfig,
-) -> None:
-    """
-    Write training pipeline health metrics to the monitoring_metrics table.
-
-    Non-fatal: the task raises TrainingMetricsWriteError on failure; the flow
-    catches it, logs WARNING, and continues with status="partial".
-
-    Alerts when val_auc_pr < 0.45 (model did not improve meaningfully).
-    """
+@task(name="log-training-metrics", retries=0, tags=["monitoring"])
+def log_training_metrics(candidate: TrainArtifact, run_id: str) -> None:
+    """Log training health metrics — console output only. Alerts when val_auc_pr < 0.45."""
     logger = get_run_logger()
-    run_date = date.today()
     auc_alert = candidate.val_auc_pr < 0.45
 
     metrics = [
-        ("val_auc_pr",       candidate.val_auc_pr,        auc_alert),
-        ("val_auc_roc",      candidate.val_auc_roc,        False),
-        ("precision_at_100", candidate.precision_at_k,     False),
-        ("recall_at_100",    candidate.recall_at_k,        False),
-        ("n_train",          float(candidate.n_train),     False),
-        ("n_val",            float(candidate.n_val),       False),
+        ("val_auc_pr",       candidate.val_auc_pr,      auc_alert),
+        ("val_auc_roc",      candidate.val_auc_roc,     False),
+        ("precision_at_100", candidate.precision_at_k,  False),
+        ("recall_at_100",    candidate.recall_at_k,     False),
+        ("n_train",          float(candidate.n_train),  False),
+        ("n_val",            float(candidate.n_val),    False),
     ]
-
-    rows = [
-        (run_date, "training", name, value, alert)
-        for name, value, alert in metrics
-    ]
-
-    sql = """
-        INSERT INTO monitoring_metrics
-            (run_date, pipeline_type, metric_name, metric_value, alert_triggered)
-        VALUES %s
-    """
-    try:
-        with _pg_conn(config) as conn:
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(cur, sql, rows)
-            conn.commit()
-    except TrainingConfigError:
-        raise
-    except Exception as exc:
-        raise TrainingMetricsWriteError(
-            f"Failed to write training metrics: {exc}"
-        ) from exc
 
     alerted = [name for name, _, alert in metrics if alert]
     if alerted:
         logger.warning(f"Training alerts triggered: {alerted}")
-    logger.info(
-        f"write_training_metrics complete | metrics_written={len(metrics)}"
-        f" | alerts={alerted} | run_id={run_id}"
-    )
+    logger.info(f"log_training_metrics complete | metrics={metrics} | run_id={run_id}")
 
 
 # ── Prefect flow ──────────────────────────────────────────────────────────────
@@ -311,7 +248,7 @@ def run_training_pipeline(
     -------
     dict with keys: status, run_id, model_version, dataset_version_id,
     val_auc_pr, n_train, n_val.
-    status is "registered" or "partial" (metrics write failed).
+    status is always "registered" once the flow reaches its end.
     """
     logger = get_run_logger()
     config = load_training_config(
@@ -338,16 +275,11 @@ def run_training_pipeline(
         candidate=candidate, dataset_version_id=dataset_version_id, config=config
     )
 
-    # ── Step 4: Health metrics (non-fatal) ────────────────────────────────────
-    status = "registered"
-    try:
-        write_training_metrics(candidate=candidate, run_id=run_id, config=config)
-    except TrainingMetricsWriteError as exc:
-        logger.error(f"Training metrics write failed (non-fatal): {exc}")
-        status = "partial"
+    # ── Step 4: Health metrics (logged only) ──────────────────────────────────
+    log_training_metrics(candidate=candidate, run_id=run_id)
 
     result = {
-        "status": status,
+        "status": "registered",
         "run_id": run_id,
         "model_version": model_version,
         "dataset_version_id": dataset_version_id,

@@ -55,9 +55,6 @@ class LabelComputationError(Exception):
 class LabelWriteError(Exception):
     """psycopg2 upsert to the labels table failed."""
 
-class LabelingMetricsWriteError(Exception):
-    """Write to monitoring_metrics failed — non-fatal."""
-
 
 # ── DB context manager ────────────────────────────────────────────────────────
 
@@ -176,66 +173,23 @@ def write_labels_postgres(labels_df: pd.DataFrame, config: LabelingConfig) -> in
     return total_written
 
 
-@task(name="log-labeling-metrics", retries=1, retry_delay_seconds=30, tags=["db", "monitoring"])
-def log_labeling_metrics(
-    labels_df: pd.DataFrame,
-    rows_written: int,
-    config: LabelingConfig,
-) -> None:
-    """
-    Write pipeline health metrics to the monitoring_metrics table.
-
-    Alerts when: cohort_size < 100, churn_rate > 0.5.
-    """
+@task(name="log-labeling-metrics", retries=0, tags=["monitoring"])
+def log_labeling_metrics(labels_df: pd.DataFrame, rows_written: int) -> None:
+    """Log labeling health metrics — console output only. Alerts when cohort_size < 100, churn_rate > 0.5."""
     logger = get_run_logger()
 
     churn_rate = float(labels_df["is_churn"].mean()) if len(labels_df) > 0 else 0.0
 
     metrics = [
-        ("cohort_size",     float(len(labels_df)),  len(labels_df) < 100),
-        ("labels_written",  float(rows_written),    False),
-        ("churn_rate",      churn_rate,             churn_rate > 0.5),
+        ("cohort_size",    float(len(labels_df)), len(labels_df) < 100),
+        ("labels_written", float(rows_written),   False),
+        ("churn_rate",     churn_rate,             churn_rate > 0.5),
     ]
-
-    rows = [
-        (config.labeled_date, "labeling", name, value, alert)
-        for name, value, alert in metrics
-    ]
-
-    sql = """
-        INSERT INTO monitoring_metrics
-            (run_date, pipeline_type, metric_name, metric_value, alert_triggered)
-        VALUES %s
-    """
-    try:
-        with _pg_conn(config) as conn:
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(cur, sql, rows)
-            conn.commit()
-    except Exception as exc:
-        raise LabelingMetricsWriteError(f"Failed to write labeling metrics: {exc}") from exc
 
     alerted = [name for name, _, alert in metrics if alert]
     if alerted:
         logger.warning(f"Labeling alerts triggered: {alerted}")
-    logger.info(f"log_labeling_metrics complete | metrics_written={len(metrics)} | alerts={alerted}")
-
-
-def _write_empty_cohort_metric(config: LabelingConfig) -> None:
-    """Write a single monitoring row when the cohort is empty. Non-fatal."""
-    sql = """
-        INSERT INTO monitoring_metrics
-            (run_date, pipeline_type, metric_name, metric_value, alert_triggered)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT DO NOTHING
-    """
-    try:
-        with _pg_conn(config) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, (config.labeled_date, "labeling", "cohort_size", 0.0, True))
-            conn.commit()
-    except Exception:
-        pass  # non-fatal; don't mask the empty-cohort early-exit
+    logger.info(f"log_labeling_metrics complete | metrics={metrics}")
 
 
 # ── Prefect flow ──────────────────────────────────────────────────────────────
@@ -265,7 +219,7 @@ def run_labeling_pipeline(
     Returns
     -------
     dict with keys: cohort_month, cohort_size, labels_written, churn_rate, status.
-    status is "success" when all tasks completed, "partial" when metrics write failed.
+    status is always "success" once the flow reaches its end.
     """
     logger = get_run_logger()
     config = load_labeling_config(
@@ -287,7 +241,6 @@ def run_labeling_pipeline(
         logger.warning(
             f"Empty cohort for cohort_month={cohort_month}. No labels written."
         )
-        _write_empty_cohort_metric(config)
         return {
             "cohort_month": cohort_month,
             "cohort_size": 0,
@@ -302,13 +255,8 @@ def run_labeling_pipeline(
     # ── Step 3: Write ─────────────────────────────────────────────────────────
     rows_written = write_labels_postgres(labels_df=labels_df, config=config)
 
-    # ── Step 4: Health metrics (non-fatal) ────────────────────────────────────
-    status = "success"
-    try:
-        log_labeling_metrics(labels_df=labels_df, rows_written=rows_written, config=config)
-    except LabelingMetricsWriteError as exc:
-        logger.error(f"Labeling metrics write failed: {exc}")
-        status = "partial"
+    # ── Step 4: Health metrics (logged only) ──────────────────────────────────
+    log_labeling_metrics(labels_df=labels_df, rows_written=rows_written)
 
     churn_rate = float(labels_df["is_churn"].dropna().mean()) if len(labels_df) > 0 else 0.0
 
@@ -317,7 +265,7 @@ def run_labeling_pipeline(
         "cohort_size": len(cohort_df),
         "labels_written": rows_written,
         "churn_rate": round(churn_rate, 4),
-        "status": status,
+        "status": "success",
     }
     logger.info(
         f"run_labeling_pipeline complete | cohort_month={result['cohort_month']}"

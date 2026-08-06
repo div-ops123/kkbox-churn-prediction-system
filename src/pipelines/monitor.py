@@ -2,18 +2,19 @@
 Production monitoring pipeline — Track 1 (drift) and Track 2 (performance).
 
 Track 1 (run_drift_monitoring): Compares the day's serving cohort feature
-    distribution against baseline training features using PSI. Writes 21 rows
-    to monitoring_metrics (20 per-feature PSI values + 1 summary). In the
-    common case it runs chained onto pipelines/serve.py's flow, reusing the
-    feature matrix serve.py already built (via the current_df parameter)
-    instead of rebuilding it. The standalone CLI invocation below still
-    rebuilds via build_features() — use it to backfill a historical date or
-    to re-run drift monitoring after a failed serving run.
+    distribution against baseline training features using PSI. Computes and
+    logs 21 metrics (20 per-feature PSI values + 1 summary) — console output
+    only, no persistence. In the common case it runs chained onto
+    pipelines/serve.py's flow, reusing the feature matrix serve.py already
+    built (via the current_df parameter) instead of rebuilding it. The
+    standalone CLI invocation below still rebuilds via build_features() —
+    use it to backfill a historical date or to re-run drift monitoring
+    after a failed serving run.
 
 Track 2 (run_performance_monitoring): Monthly. Joins month M predictions with
-    month M labels to compute AUC-PR, AUC-ROC, Precision@K, Recall@K. Writes
-    6 rows to monitoring_metrics. Optionally triggers retraining when AUC-PR
-    falls below threshold.
+    month M labels to compute AUC-PR, AUC-ROC, Precision@K, Recall@K.
+    Computes and logs 6 metrics — console output only. Optionally triggers
+    retraining when AUC-PR falls below threshold.
 
 Track 3 (pipeline health) is handled inline by serve.py, label.py,
     build_dataset.py, train.py, and validate.py.
@@ -38,7 +39,6 @@ from typing import Generator
 import mlflow
 import pandas as pd
 import psycopg2
-import psycopg2.extras
 from prefect import flow, get_run_logger, task
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -79,9 +79,6 @@ class LabelsQueryError(Exception):
 class PerformanceComputationError(Exception):
     """evaluate_cohort_performance() failed."""
 
-class MonitoringMetricsWriteError(Exception):
-    """INSERT to monitoring_metrics failed — non-fatal."""
-
 class RetrainingTriggerError(Exception):
     """run_training_pipeline() raised — non-fatal."""
 
@@ -99,29 +96,6 @@ def _pg_conn(config: MonitoringConfig) -> Generator[psycopg2.extensions.connecti
     finally:
         if conn is not None:
             conn.close()
-
-
-def _write_alert_metric(
-    config: MonitoringConfig,
-    pipeline_type: str,
-    metric_name: str,
-    metric_value: float,
-) -> None:
-    """Write a single alert metric row. Completely non-fatal — swallows all errors."""
-    
-    sql = """
-        INSERT INTO monitoring_metrics
-            (run_date, pipeline_type, metric_name, metric_value, alert_triggered)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT DO NOTHING
-    """
-    try:
-        with _pg_conn(config) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, (date.today(), pipeline_type, metric_name, metric_value, True))
-            conn.commit()
-    except Exception:
-        pass
 
 
 # ── Flow 1 tasks: Drift monitoring ────────────────────────────────────────────
@@ -251,7 +225,7 @@ def build_drift_features(
     return current_df
 
 
-@task(name="run-drift-check", retries=0, tags=["drift", "db"])
+@task(name="run-drift-check", retries=0, tags=["drift"])
 def run_drift_check(
     current_df: pd.DataFrame,
     baseline_df: pd.DataFrame,
@@ -259,18 +233,14 @@ def run_drift_check(
     scoring_date: date,
 ) -> dict:
     """
-    Compute PSI per feature against baseline_df, write 21 rows to monitoring_metrics.
+    Compute PSI per feature against baseline_df, log 21 metrics (console only).
 
-    Writes:
-      - 20 rows: (scoring_date, "data_drift", "psi_{col}", psi_value, psi > threshold)
-        one per feature in FEATURE_COLS.
-      - 1 summary row: (scoring_date, "data_drift", "n_drifted_features", count, count > 0)
+    Logs:
+      - 20 values: psi_{col} per feature in FEATURE_COLS.
+      - 1 summary value: n_drifted_features.
 
     Returns:
         Dict with n_drifted_features (int) and drifted_features (list of str).
-
-    Raises:
-        MonitoringMetricsWriteError: If the DB write fails (non-fatal at flow level).
     """
     logger = get_run_logger()
 
@@ -282,33 +252,10 @@ def run_drift_check(
     drifted = [col for col, psi in psi_scores.items() if psi > config.psi_alert_threshold]
     n_drifted = len(drifted)
 
-    rows = [
-        (scoring_date, "data_drift", f"psi_{col}", psi, psi > config.psi_alert_threshold)
-        for col, psi in psi_scores.items()
-    ]
-    rows.append((scoring_date, "data_drift", "n_drifted_features", float(n_drifted), n_drifted > 0))
-
-    sql = """
-        INSERT INTO monitoring_metrics
-            (run_date, pipeline_type, metric_name, metric_value, alert_triggered)
-        VALUES %s
-    """
-    try:
-        with _pg_conn(config) as conn:
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(cur, sql, rows)
-            conn.commit()
-    except MonitoringConfigError:
-        raise
-    except Exception as exc:
-        raise MonitoringMetricsWriteError(
-            f"Failed to write drift metrics: {exc}"
-        ) from exc
-
     if drifted:
         logger.warning(f"run_drift_check | drifted features (PSI > {config.psi_alert_threshold}): {drifted}")
     logger.info(
-        f"run_drift_check | metrics_written={len(rows)}"
+        f"run_drift_check | psi_scores={psi_scores}"
         f" | n_drifted={n_drifted} | scoring_date={scoring_date}"
     )
     return {"n_drifted_features": n_drifted, "drifted_features": drifted}
@@ -380,7 +327,7 @@ def load_labels_for_month(config: MonitoringConfig, cohort_month: str) -> pd.Dat
     return df
 
 
-@task(name="compute-and-log-performance", retries=0, tags=["perf", "db"])
+@task(name="compute-and-log-performance", retries=0, tags=["perf"])
 def compute_and_log_performance(
     predictions_df: pd.DataFrame,
     labels_df: pd.DataFrame,
@@ -388,10 +335,8 @@ def compute_and_log_performance(
     cohort_month: str,
 ) -> dict:
     """
-    Join predictions with labels, compute performance metrics, write 6 rows to monitoring_metrics.
-
-    Writes (pipeline_type="model_perf"):
-        auc_pr, auc_roc, precision_at_k, recall_at_k, n_total, n_churned.
+    Join predictions with labels, compute performance metrics, log 6 metrics
+    (console only): auc_pr, auc_roc, precision_at_k, recall_at_k, n_total, n_churned.
 
     Args:
         predictions_df: DataFrame[msno, score, expiry_date] filtered to cohort_month.
@@ -405,10 +350,8 @@ def compute_and_log_performance(
 
     Raises:
         PerformanceComputationError: If evaluate_cohort_performance fails.
-        MonitoringMetricsWriteError: If the DB write fails (non-fatal at flow level).
     """
     logger = get_run_logger()
-    run_date = date.today()
 
     try:
         perf = evaluate_cohort_performance(
@@ -428,35 +371,11 @@ def compute_and_log_performance(
     auc_pr_alert = auc_pr is not None and auc_pr < config.auc_pr_alert_threshold
     auc_pr_str = f"{auc_pr:.4f}" if auc_pr is not None else "N/A"
 
-    rows = [
-        (run_date, "model_perf", "auc_pr",        auc_pr if auc_pr is not None else 0.0, auc_pr_alert),
-        (run_date, "model_perf", "auc_roc",        perf["auc_roc"] if perf["auc_roc"] is not None else 0.0, False),
-        (run_date, "model_perf", "precision_at_k", perf["precision_at_k"],                False),
-        (run_date, "model_perf", "recall_at_k",    perf["recall_at_k"],                   False),
-        (run_date, "model_perf", "n_total",         float(perf["n_total"]),               False),
-        (run_date, "model_perf", "n_churned",       float(perf["n_churned"]),             False),
-    ]
-
-    sql = """
-        INSERT INTO monitoring_metrics
-            (run_date, pipeline_type, metric_name, metric_value, alert_triggered)
-        VALUES %s
-    """
-    try:
-        with _pg_conn(config) as conn:
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(cur, sql, rows)
-            conn.commit()
-    except MonitoringConfigError:
-        raise
-    except Exception as exc:
-        raise MonitoringMetricsWriteError(
-            f"Failed to write performance metrics: {exc}"
-        ) from exc
-
     logger.info(
         f"compute_and_log_performance | cohort_month={cohort_month}"
-        f" | auc_pr={auc_pr_str} | n_total={perf['n_total']}"
+        f" | auc_pr={auc_pr_str} | auc_roc={perf['auc_roc']}"
+        f" | precision_at_k={perf['precision_at_k']} | recall_at_k={perf['recall_at_k']}"
+        f" | n_total={perf['n_total']} | n_churned={perf['n_churned']}"
         f" | auc_pr_alert={auc_pr_alert}"
     )
     return {**perf, "auc_pr_alert": auc_pr_alert}
@@ -544,7 +463,7 @@ def run_drift_monitoring(
     Returns:
         Dict with keys: scoring_date, cohort_size, n_drifted_features,
         drifted_features, status.
-        status: "success" | "partial" | "empty_cohort" | "baseline_missing"
+        status: "success" | "empty_cohort" | "baseline_missing"
     """
     logger = get_run_logger()
     config = load_monitoring_config(data_source=data_source, data_dir=data_dir)
@@ -560,7 +479,6 @@ def run_drift_monitoring(
         # ── Chained path: reuse the feature matrix serve.py already built ────
         if len(current_df) == 0:
             logger.warning(f"Empty current_df for scoring_date={target_date} — exiting early.")
-            _write_alert_metric(config, "data_drift", "cohort_size", 0.0)
             return {
                 "scoring_date":       str(target_date),
                 "cohort_size":        0,
@@ -575,7 +493,6 @@ def run_drift_monitoring(
             cohort_df = load_serving_cohort(config=config, scoring_date=target_date)
         except EmptyServingCohortError:
             logger.warning(f"Empty serving cohort for scoring_date={target_date} — exiting early.")
-            _write_alert_metric(config, "data_drift", "cohort_size", 0.0)
             return {
                 "scoring_date":       str(target_date),
                 "cohort_size":        0,
@@ -591,7 +508,6 @@ def run_drift_monitoring(
         dataset_version_id = resolve_production_dataset_version_id(config=config)
     except BaselineNotFoundError as exc:
         logger.error(f"run_drift_monitoring | baseline missing: {exc}")
-        _write_alert_metric(config, "data_drift", "baseline_missing", 1.0)
         return {
             "scoring_date":       str(target_date),
             "cohort_size":        cohort_size,
@@ -617,7 +533,6 @@ def run_drift_monitoring(
         )
     except BaselineNotFoundError as exc:
         logger.error(f"run_drift_monitoring | baseline missing: {exc}")
-        _write_alert_metric(config, "data_drift", "baseline_missing", 1.0)
         return {
             "scoring_date":       str(target_date),
             "cohort_size":        cohort_size,
@@ -625,9 +540,6 @@ def run_drift_monitoring(
             "drifted_features":   [],
             "status":             "baseline_missing",
         }
-    except MonitoringMetricsWriteError as exc:
-        logger.error(f"run_drift_monitoring | metrics write failed (non-fatal): {exc}")
-        status = "partial"
 
     result = {
         "scoring_date":       str(target_date),
@@ -682,7 +594,6 @@ def run_performance_monitoring(
     predictions_df = load_predictions_for_month(config=config, cohort_month=cohort_month)
     if len(predictions_df) == 0:
         logger.warning(f"No predictions for cohort_month={cohort_month} — exiting early.")
-        _write_alert_metric(config, "model_perf", "n_predictions", 0.0)
         return {
             "cohort_month":         cohort_month,
             "n_predictions":        0,
@@ -699,7 +610,6 @@ def run_performance_monitoring(
     labels_df = load_labels_for_month(config=config, cohort_month=cohort_month)
     if len(labels_df) == 0:
         logger.warning(f"No labels for cohort_month={cohort_month} — exiting early.")
-        _write_alert_metric(config, "model_perf", "n_labels", 0.0)
         return {
             "cohort_month":         cohort_month,
             "n_predictions":        len(predictions_df),
@@ -722,8 +632,8 @@ def run_performance_monitoring(
             config=config,
             cohort_month=cohort_month,
         )
-    except (PerformanceComputationError, MonitoringMetricsWriteError) as exc:
-        logger.error(f"run_performance_monitoring | compute/write failed (non-fatal): {exc}")
+    except PerformanceComputationError as exc:
+        logger.error(f"run_performance_monitoring | compute failed (non-fatal): {exc}")
         status = "partial"
 
     # ── Step 4: Maybe trigger retraining ──────────────────────────────────────

@@ -84,9 +84,6 @@ class DatabaseWriteError(Exception):
 class ParquetWriteError(Exception):
     """OSError or pyarrow error during Parquet write."""
 
-class MetricsWriteError(Exception):
-    """Failure writing to monitoring_metrics — non-fatal."""
-
 
 # ── DB context manager ────────────────────────────────────────────────────────
 
@@ -391,7 +388,7 @@ def write_predictions_parquet(
     return out_path
 
 
-@task(name="log-pipeline-health-metrics", retries=2, retry_delay_seconds=30, tags=["db", "monitoring"])
+@task(name="log-pipeline-health-metrics", retries=0, tags=["monitoring"])
 def log_pipeline_health_metrics(
     scoring_date: date,
     cohort_size: int,
@@ -399,12 +396,8 @@ def log_pipeline_health_metrics(
     scores: np.ndarray,
     tiers: list[str],
     rows_written: int,
-    config: ServingConfig,
 ) -> None:
-    """
-    Write pipeline health metrics to the monitoring_metrics table.
-    Alerts when cohort_size < 100 or overall null rate > 0.99.
-    """
+    """Log pipeline health metrics — console output only. Alerts when cohort_size < 100 or null rate > 0.99."""
     logger = get_run_logger()
 
     txn_cols = FEATURE_COLS[:12]
@@ -422,59 +415,27 @@ def log_pipeline_health_metrics(
     low_pct = tiers.count("LOW") / n if n else 0.0
 
     metrics = [
-        ("cohort_size",         float(cohort_size),             cohort_size < 100),
-        ("null_rate_overall",   null_overall,                   null_overall > 0.99),
-        ("null_rate_txn",       null_txn,                       False),
-        ("null_rate_log",       null_log,                       False),
-        ("null_rate_member",    null_mem,                       False),
-        ("score_mean",          float(np.mean(scores)),         False),
-        ("score_p50",           float(np.percentile(scores, 50)), False),
-        ("score_p90",           float(np.percentile(scores, 90)), False),
-        ("high_tier_pct",       high_pct,                       False),
-        ("med_tier_pct",        med_pct,                        False),
-        ("low_tier_pct",        low_pct,                        False),
-        ("rows_written",        float(rows_written),            False),
+        ("cohort_size",       float(cohort_size),               cohort_size < 100),
+        ("null_rate_overall", null_overall,                     null_overall > 0.99),
+        ("null_rate_txn",     null_txn,                         False),
+        ("null_rate_log",     null_log,                         False),
+        ("null_rate_member",  null_mem,                         False),
+        ("score_mean",        float(np.mean(scores)),           False),
+        ("score_p50",         float(np.percentile(scores, 50)), False),
+        ("score_p90",         float(np.percentile(scores, 90)), False),
+        ("high_tier_pct",     high_pct,                         False),
+        ("med_tier_pct",      med_pct,                          False),
+        ("low_tier_pct",      low_pct,                          False),
+        ("rows_written",      float(rows_written),              False),
     ]
-
-    rows = [
-        (scoring_date, "pipeline_health", name, value, alert)
-        for name, value, alert in metrics
-    ]
-
-    sql = """
-        INSERT INTO monitoring_metrics
-            (run_date, pipeline_type, metric_name, metric_value, alert_triggered)
-        VALUES %s
-    """
-    try:
-        with _pg_conn(config) as conn:
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(cur, sql, rows)
-            conn.commit()
-    except Exception as exc:
-        raise MetricsWriteError(f"Failed to write pipeline health metrics: {exc}") from exc
 
     alerted = [name for name, _, alert in metrics if alert]
     if alerted:
         logger.warning(f"Pipeline health alerts triggered: {alerted}")
-    logger.info(f"log_pipeline_health_metrics complete | metrics_written={len(metrics)} | alerts={alerted}")
-
-
-def _write_zero_cohort_metric(scoring_date: date, config: ServingConfig) -> None:
-    """Write a single monitoring metric row when the cohort is empty."""
-    sql = """
-        INSERT INTO monitoring_metrics
-            (run_date, pipeline_type, metric_name, metric_value, alert_triggered)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT DO NOTHING
-    """
-    try:
-        with _pg_conn(config) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, (scoring_date, "pipeline_health", "cohort_size", 0.0, True))
-            conn.commit()
-    except Exception:
-        pass  # non-fatal; don't mask the empty-cohort early-exit
+    logger.info(
+        f"log_pipeline_health_metrics complete | scoring_date={scoring_date}"
+        f" | metrics={metrics} | alerts={alerted}"
+    )
 
 
 # ── Prefect flow ──────────────────────────────────────────────────────────────
@@ -523,7 +484,6 @@ def run_serving_pipeline(
         logger.warning(
             f"Empty cohort for scoring_date={scoring_date}. No predictions written."
         )
-        _write_zero_cohort_metric(scoring_date, config)
         return {
             "scoring_date": str(scoring_date),
             "cohort_size": 0,
@@ -563,21 +523,16 @@ def run_serving_pipeline(
     except ParquetWriteError as exc:
         logger.warning(f"Parquet write failed (non-fatal): {exc}")
 
-    # ── Step 8: Health metrics (non-fatal) ────────────────────────────────────
+    # ── Step 8: Health metrics (logged only) ──────────────────────────────────
     status = "success"
-    try:
-        log_pipeline_health_metrics(
-            scoring_date=scoring_date,
-            cohort_size=len(cohort_df),
-            feature_df=feature_df,
-            scores=scores,
-            tiers=tiers,
-            rows_written=rows_written,
-            config=config,
-        )
-    except MetricsWriteError as exc:
-        logger.error(f"Health metrics write failed: {exc}")
-        status = "partial"
+    log_pipeline_health_metrics(
+        scoring_date=scoring_date,
+        cohort_size=len(cohort_df),
+        feature_df=feature_df,
+        scores=scores,
+        tiers=tiers,
+        rows_written=rows_written,
+    )
 
     # ── Step 9: Drift monitoring, chained (non-fatal) ─────────────────────────
     # Passes the feature matrix already built above so run_drift_monitoring
