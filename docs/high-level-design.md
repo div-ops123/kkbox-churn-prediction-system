@@ -1,144 +1,137 @@
 
 # High-Level Design
 
-## Failure 1 — Feature Store question: you are half right
-
-Your 3 tables are your point-in-time source of truth during training because you control the feature cutoff per user explicitly in code. But at serving time you are computing features on the fly from raw tables every single day. That means your serving pipeline is re-running the same feature logic daily on raw data. This is acceptable for MVP. But you need to acknowledge that your feature transformation code must be identical between training and serving — one shared module, not two separate scripts. That is your point-in-time correctness mechanism for MVP. Not a feature store. A feature store solves this at scale. You solve it at MVP scale with disciplined code reuse.
-
-## Failure 2 — Risk tier definition is floating
-
-You output High/Medium/Low tiers but you haven't defined the thresholds. Who sets them? Are they fixed? Are they percentile-based? If your model's score distribution shifts after retraining, do your tiers shift with it? This needs to be a defined, versioned configuration — not a hardcoded if/else.
-
----
-
 ## **High-Level Design**
 
 ---
 
 ### **Components and Responsibilities**
 
-┌─────────────────────────────────────────────────────────────────┐  
-│                        DATA SOURCES                             │  
-│         transactions table │ user_logs table │ members table    │  
-└─────────────────┬───────────────────────────────────────────────┘  
-                  │ raw data  
-        ┌─────────▼──────────────────────────────────────────┐  
-        │              FEATURE ENGINEERING MODULE             │  
-        │  Shared library. Called by BOTH training pipeline   │  
-        │  and serving pipeline. Single source of truth for   │  
-        │  all feature transformations. Versioned in code.    │  
-        │  Input: user\_id, feature\_cutoff\_date                │  
-        │  Output: feature vector per user                    │  
-        └─────────┬──────────────────────────┬───────────────┘  
-                  │                          │  
-      ┌───────────▼──────────┐   ┌───────────▼──────────────┐  
-      │   TRAINING PIPELINE  │   │    SERVING PIPELINE       │  
-      │                      │   │                           │  
-      │  Trigger: monthly     │   │  Trigger: daily cron      │  
-      │  or perf-triggered   │   │                           │  
-      │                      │   │  1\. Query transactions    │  
-      │  1\. Pull label table │   │     for users expiring    │  
-      │  2\. Call feature     │   │     in 13-15 days         │  
-      │     module per user  │   │  2\. Call feature module   │  
-      │     at feature\_cutoff│   │     per user at           │  
-      │  3\. Time-based split │   │     expiry \- 14 days      │  
-      │  4\. Train candidate  │   │  3\. Load production model │  
-      │     model            │   │     from model registry   │  
-      │  5\. Compare against  │   │  4\. Score cohort          │  
-      │     production model │   │  5\. Apply tier thresholds │  
-      │     on validation set│   │     from config           │  
-      │  6\. If better:       │   │  6\. Write to prediction   │  
-      │     push to registry │   │     store with timestamp  │  
-      │     tag as production│   │  7\. Write to output file  │  
-      └───────────┬──────────┘   │     (Parquet/CSV)         │  
-                  │              └───────────┬───────────────┘  
-                  │                          │  
-      ┌───────────▼──────────┐   ┌───────────▼───────────────┐  
-      │    MODEL REGISTRY    │   │     PREDICTION STORE       │  
-      │                      │   │                            │  
-      │  Stores all model    │   │  Permanent log of every   │  
-      │  artifacts with:     │   │  scoring run:             │  
-      │  \- version           │   │  user\_id                  │  
-      │  \- metrics           │   │  score                    │  
-      │  \- feature list      │   │  risk\_tier                │  
-      │  \- training date     │   │  scoring\_date             │  
-      │  \- production tag    │   │  expiry\_date              │  
-      │                      │   │  model\_version            │  
-      └──────────────────────┘   └───────────┬───────────────┘  
-                                             │  
-                                 ┌───────────▼───────────────┐  
-                                 │        SCORE API           │  
-                                 │                            │  
-                                 │  Lightweight REST API      │  
-                                 │  Reads from prediction     │  
-                                 │  store only.               │  
-                                 │  Does NOT run the model.   │  
-                                 │  Endpoints:                │  
-                                 │  GET /score/{user\_id}      │  
-                                 │  GET /cohort/{date}        │  
-                                 └───────────────────────────┘
+#### Data Sources
 
-┌──────────────────────────────────────────────────────────────────┐  
-│                     LABELING PIPELINE                            │  
-│                                                                  │  
-│  Trigger: monthly, on the 1st (labels for month M-1 now ready)  │  
-│                                                                  │  
-│  1\. Query transactions for users whose anchor\_expiry\_date        │  
-│     fell in month M-1                                           │  
-│  2\. Apply churn rule: no valid non-cancel transaction            │  
-│     within 30 days of expiry                                    │  
-│  3\. Write to label store:                                        │  
-│     user\_id, anchor\_expiry\_date, feature\_cutoff\_date, is\_churn  │  
-│  4\. Emit event → triggers monitoring pipeline                    │  
-└──────────────────────────┬───────────────────────────────────────┘  
-                           │ triggers  
-┌──────────────────────────▼───────────────────────────────────────┐  
-│                    MONITORING PIPELINE                           │  
-│                                                                  │  
-│  Trigger: after labeling pipeline completes                      │  
-│                                                                  │  
-│  Track 1 — Data Drift (runs daily after serving)                │  
-│    Compare today's feature distributions against                 │  
-│    training baseline. Alert if PSI \> threshold.                  │  
-│                                                                  │  
-│  Track 2 — Model Performance (runs monthly after labeling)      │  
-│    Join prediction store (month M-1 predictions)                 │  
-│    with label store (month M-1 actuals)                         │  
-│    Compute: AUC, Precision@K, Recall                            │  
-│    Compare against baseline threshold                            │  
-│                                                                  │  
-│  Track 3 — Pipeline Health (runs after every pipeline)          │  
-│    Cohort size anomaly detection                                 │  
-│    Missing data checks                                           │  
-│    Feature null rate checks                                      │  
-│                                                                  │  
-│  Output:                                                         │  
-│    \- Metrics log (every run)                                     │  
-│    \- Alert if drift or degradation threshold breached            │  
-│    \- Retraining trigger if AUC \< defined threshold               │  
-└──────────────────────────────────────────────────────────────────┘
+`transactions` table · `user_logs` table · `members` table (raw PostgreSQL tables).
+
+#### Feature Engineering Module — `src/core/feature_module.py`
+
+Shared, stateless library — a pure **Transform**, not a pipeline. Called separately, each with its own cohort, by three independent pipelines: the dataset-build pipeline, the serving pipeline, and the monitoring pipeline's drift track. There is no single shared dataset that all three read from — what's shared is the code, not the output. Single source of truth for all feature transformations, versioned in code.
+
+Input: `msno`, `feature_cutoff_date` (always `expiry_date - 14 days`, enforced internally). Output: feature vector per user.
+
+#### Dataset-Build Pipeline (ETL) — `src/pipelines/build_dataset.py`
+
+Trigger: called by the retrain orchestrator, or run standalone.
+
+1. Pull the labeled cohort from the label store.
+2. Compute `p99_secs` for this cohort (the `total_secs` winsorization threshold).
+3. Call the feature module.
+4. Rolling 3-way split: the most recent labeled month becomes the **test** set (held out entirely — never used for fitting or early stopping), the second-most-recent becomes **val** (early stopping only), everything older becomes **train**.
+5. Load train/val/test parquet + a drift baseline (train+val features only, never test) + `feature_config.json` to a dedicated MLflow run.
+
+Output: `dataset_version_id` (the MLflow run_id) — the handle the training and validation pipelines consume instead of rebuilding features themselves.
+
+#### Training Pipeline (ML — fit only) — `src/pipelines/train.py`
+
+Trigger: called by the retrain orchestrator with a `dataset_version_id`, or run standalone.
+
+1. Fetch train + val from that dataset (no raw data, no feature computation — that's the dataset-build pipeline's job).
+2. Fit LightGBM, early-stopping on val.
+3. Register a new model version, tagged with the `dataset_version_id` it was trained on.
+4. Never sets an alias. The model exists, versioned and inspectable, but unpromoted.
+
+#### Validation Pipeline (ML — evaluate & decide) — `src/pipelines/validate.py`
+
+Trigger: called by the retrain orchestrator with a `dataset_version_id` + `candidate_version`, or run standalone.
+
+1. Fetch the held-out test set from that dataset — the fold neither fitting nor early stopping ever touched.
+2. Load the candidate model and the current production model.
+3. Score both on the same test set.
+4. If the candidate wins (or no production model exists yet): alias it `challenger`. Never touches `production` — promoting `challenger` → `production` is a deployment-strategy decision (canary, shadow mode, etc.), explicitly out of scope for this project.
+
+#### Retrain Orchestrator (thin caller, not a pipeline) — `src/pipelines/retrain.py`
+
+Wires Dataset-Build → Training → Validation together for the common case: monthly cron, or a monitoring-triggered retrain. Each of the three stays independently invocable — e.g. re-running validation alone against an older candidate never touches this file.
+
+#### Model Registry — MLflow
+
+Stores every model version with:
+
+- version
+- metrics
+- feature list
+- `dataset_version_id` tag — lineage back to the exact train/val/test snapshot this version was trained on
+- aliases: `production` (live, read by serving and monitoring) and `challenger` (a candidate that beat production in validation, not yet live)
+
+#### Serving Pipeline (ETL + inference) — `src/pipelines/serve.py`
+
+Trigger: daily cron.
+
+1. Query transactions for users expiring in 13–15 days.
+2. Call the feature module per user at `expiry_date - 14 days`.
+3. Load the production model and its `dataset_version_id` tag from the registry.
+4. Fetch `p99_secs` from that dataset's MLflow artifacts — not a local file (see the durability note under Design Decisions Locked).
+5. Score the cohort.
+6. Apply tier thresholds from config.
+7. Write to the prediction store with a timestamp.
+8. Write to an output file (Parquet/CSV).
+
+#### Prediction Store
+
+Permanent log of every scoring run: `msno`, `score`, `risk_tier`, `scoring_date`, `expiry_date`, `model_version`.
+
+#### Score API
+
+Lightweight REST API. Reads from the prediction store only. Does **not** run the model.
+
+`GET /score/{user_id}` · `GET /cohort/{date}`
+
+#### Labeling Pipeline (ETL) — `src/pipelines/label.py`
+
+Trigger: monthly, on the 1st (labels for month M-1 now ready).
+
+1. Query transactions for users whose `anchor_expiry_date` fell in month M-1.
+2. Apply the churn rule: no valid non-cancel transaction within 30 days of expiry.
+3. Write to the label store: `msno`, `anchor_expiry_date`, `feature_cutoff_date`, `is_churn`.
+4. Emit event → triggers the monitoring pipeline.
+
+#### Monitoring Pipeline — `src/pipelines/monitor.py`
+
+Two tracks, deliberately kept structurally different — see Design Decisions Locked.
+
+**Track 1 — Data Drift** (ET-shaped: extracts a cohort and transforms it via the feature module, but loads only a metrics row, not a dataset). Runs daily. Resolves the `dataset_version_id` tagged on whichever model currently holds the `production` alias, fetches that dataset's baseline features + `p99_secs` from MLflow (never a local file), calls the feature module on today's serving cohort, computes PSI per feature. Alerts if PSI > threshold.
+
+**Track 2 — Model Performance** (no transform stage at all — it joins already-scored data, it never calls the feature module). Runs monthly. Joins the prediction store (month M-1 predictions) with the label store (month M-1 actuals). Computes AUC-PR, AUC-ROC, Precision@K, Recall@K. Compares against a baseline threshold. If AUC-PR falls below threshold, triggers the **retrain orchestrator** — not the training pipeline directly (see Design Decisions Locked).
+
+**Track 3 — Pipeline Health** (handled inline by every pipeline, not a separate flow). Cohort size anomaly detection, missing data checks, feature null rate checks. Each of `serve.py`, `label.py`, `build_dataset.py`, `train.py`, and `validate.py` writes its own health rows to `monitoring_metrics`.
+
+Output: metrics log (every run), alert if drift or degradation threshold breached, retraining trigger if AUC-PR < defined threshold.
 
 ---
 
 ### **Data Flow Summary**
 
-RAW TABLES  
-    │  
-    ├──► LABELING PIPELINE ──► LABEL STORE  
-    │         │  
-    │         └──► MONITORING PIPELINE ◄── PREDICTION STORE  
-    │                   │  
-    │                   └──► RETRAINING TRIGGER  
-    │                               │  
-    ├──► FEATURE MODULE ◄───────────┘  
-    │         │  
-    │         ├──► TRAINING PIPELINE ──► MODEL REGISTRY  
-    │         │  
-    │         └──► SERVING PIPELINE ──► PREDICTION STORE ──► SCORE API  
-    │                                        │  
-    │                                        └──► OUTPUT FILE (Parquet)  
-    │                                                │  
-    │                                                └──► MARKETING / CRM
+**Retrain path** (monthly cron, or monitoring-triggered):
+
+```
+RAW TABLES
+  → LABELING PIPELINE → LABEL STORE
+      → MONITORING PIPELINE (Track 2) ← PREDICTION STORE
+          → RETRAIN ORCHESTRATOR
+              → DATASET-BUILD PIPELINE ← LABEL STORE
+                  → MLflow artifacts (dataset_version_id: train / val / test / baseline / feature_config)
+                      → TRAINING PIPELINE → MODEL REGISTRY (new version, unpromoted)
+                          → VALIDATION PIPELINE ← MLflow artifacts (test set) + MODEL REGISTRY (production model)
+                              → MODEL REGISTRY (challenger alias, only if the candidate wins)
+```
+
+**Serving path** (daily cron, fully independent of the retrain path above):
+
+```
+RAW TABLES
+  → FEATURE MODULE (shared code, called separately here — not a shared dataset)
+      → SERVING PIPELINE ← MODEL REGISTRY (production alias + its dataset_version_id)
+          → PREDICTION STORE → SCORE API
+              → OUTPUT FILE (Parquet) → MARKETING / CRM
+```
 
 ---
 
@@ -146,24 +139,35 @@ RAW TABLES
 
 | From | To | Interface | Format |
 | ----- | ----- | ----- | ----- |
-| Raw tables | Feature module | Direct query with user\_id \+ cutoff\_date | SQL / Pandas |
-| Feature module | Training pipeline | Feature matrix | DataFrame |
+| Raw tables | Feature module | Direct query with `msno` + cutoff date | SQL / Pandas |
+| Feature module | Dataset-build pipeline | Feature matrix | DataFrame |
 | Feature module | Serving pipeline | Feature matrix | DataFrame |
-| Label store | Training pipeline | Labeled cohort | Parquet |
-| Label store | Monitoring pipeline | Actuals for evaluation | Parquet |
+| Feature module | Monitoring pipeline (drift track) | Feature matrix | DataFrame |
+| Label store | Dataset-build pipeline | Labeled cohort | SQL |
+| Label store | Monitoring pipeline | Actuals for evaluation | SQL |
+| Dataset-build pipeline | MLflow artifacts | train/val/test + baseline features + feature_config, keyed by `dataset_version_id` | Parquet / JSON |
+| MLflow artifacts (`dataset_version_id`) | Training pipeline | train + val datasets | Parquet |
+| MLflow artifacts (`dataset_version_id`) | Validation pipeline | test dataset | Parquet |
+| Training pipeline | Model registry | New model version, tagged `dataset_version_id` (unpromoted) | MLflow |
+| Model registry (candidate + production) | Validation pipeline | Models to compare on the test set | MLflow |
+| Validation pipeline | Model registry | `challenger` alias (only if the candidate wins) | MLflow |
+| Model registry (`production` alias) | Serving pipeline | Production model + its `dataset_version_id` | MLflow |
+| Model registry (`production` alias) + MLflow artifacts | Monitoring pipeline (drift track) | Baseline features + `p99_secs` | Parquet / JSON |
 | Serving pipeline | Prediction store | Scored cohort with metadata | Parquet |
-| Prediction store | Score API | Query by user\_id or date | REST / JSON |
-| Prediction store | Monitoring pipeline | Historical predictions | Parquet |
-| Model registry | Serving pipeline | Production model artifact | Pickle / ONNX |
-| Monitoring pipeline | Training pipeline | Retraining trigger | Event / Flag |
+| Prediction store | Score API | Query by `msno` or date | REST / JSON |
+| Prediction store | Monitoring pipeline | Historical predictions | SQL |
+| Monitoring pipeline | Retrain orchestrator | Retraining trigger | Direct Prefect subflow call |
 | Serving pipeline | Marketing/CRM | Daily scored list | Parquet / CSV |
 
 ---
 
-### **One Design Decision To Lock Before Low-Level Design**
+### **Design Decisions Locked Before Low-Level Design**
 
-Your monitoring pipeline has two distinct tracks running on different cadences — daily drift checks and monthly performance checks. These should share a monitoring module but have separate entry points and separate alert channels. Do not merge them into one script that tries to do both. Daily drift failures should not block monthly performance evaluation.
+**1. Monitoring's two tracks stay structurally separate.** Daily drift checks and monthly performance checks run on different cadences and have different shapes (Track 1 calls the feature module, Track 2 never does). They share a monitoring module but have separate entry points and separate alert channels. Do not merge them into one script that tries to do both — daily drift failures must not block monthly performance evaluation.
 
+**2. Training never decides promotion.** The dataset-build pipeline holds out the most recent labeled month as a test set the training pipeline never sees — not for fitting, not for early stopping. Training always registers a new model version and stops there; it never compares against production and never sets an alias. Only the validation pipeline, scoring on that untouched test fold, decides whether a candidate becomes `challenger`. This closes a real gap in the original single-pipeline design: comparing production against a candidate on the same fold the candidate's early stopping had already used gave the candidate a structural advantage in the comparison. Promoting `challenger` to `production` is a further, deliberately out-of-scope decision — it belongs to a deployment strategy (canary, shadow mode, etc.) not designed here.
+
+**3. Dataset artifacts live in MLflow, not local disk.** `feature_config.json` and the drift baseline used to be written to `models/` on local disk, read back by whichever pipeline needed them next. `docker-compose.yml` mounts durable volumes for Postgres, MLflow, and Grafana, but nothing for `models/` — a redeploy between training and the next drift check would silently wipe them. Worse, the file was overwritten on every training run regardless of promotion, so an unpromoted candidate could silently change what serving used. Both are fixed by tagging every model version with the `dataset_version_id` it was trained on and having callers fetch `p99_secs`/baseline from that dataset's MLflow artifacts — durability comes from MLflow's already-durable artifact store, and staleness is fixed because callers always resolve the artifact through *the currently-aliased model*, never "whatever was last written."
 
 ---
 
@@ -186,7 +190,7 @@ Your monitoring pipeline has two distinct tracks running on different cadences �
 
 **Why DuckDB specifically:** DuckDB runs inside your Python process, queries Parquet files and CSVs directly without loading them fully into RAM, and executes analytical SQL at speeds that make 18M row aggregations take seconds not minutes. You do not need a database server running for EDA. You run SQL directly on your files. This is the single best tool for exploratory data work at this scale on a laptop.
 
-**For model training:** once you move from EDA to actual training, your feature engineering module queries PostgreSQL and outputs feature matrices as Parquet. Training then reads Parquet. This keeps RAM usage bounded.
+**For model training:** once you move from EDA to actual training, the dataset-build pipeline queries PostgreSQL and outputs feature matrices as Parquet artifacts in MLflow. Training and validation then read Parquet. This keeps RAM usage bounded.
 
 ---
 
@@ -194,9 +198,9 @@ Your monitoring pipeline has two distinct tracks running on different cadences �
 
 **What:** Prefect Cloud free tier or Prefect self-hosted.
 
-**Why not Airflow:** Airflow requires running a scheduler daemon, a metadata database, and a webserver as separate processes. For one engineer managing 4 pipelines, the operational overhead is disproportionate. When the scheduler crashes you get silent failures.
+**Why not Airflow:** Airflow requires running a scheduler daemon, a metadata database, and a webserver as separate processes. For one engineer managing several pipelines, the operational overhead is disproportionate. When the scheduler crashes you get silent failures.
 
-**Why Prefect:** Prefect is Python-native — your pipelines are just Python functions decorated with `@flow` and `@task`. It has a local runner that requires zero infrastructure, a free cloud dashboard for monitoring runs, built-in retry logic, and failure alerting. You can graduate to Airflow later when the team grows and complexity justifies it.
+**Why Prefect:** Prefect is Python-native — your pipelines are just Python functions decorated with `@flow` and `@task`. It has a local runner that requires zero infrastructure, a free cloud dashboard for monitoring runs, built-in retry logic, and failure alerting. Calling one `@flow` from inside another creates a traceable child flow run, which is exactly the mechanism the retrain orchestrator and the monitoring-triggered retrain use — no separate event bus. You can graduate to Airflow later when the team grows and complexity justifies it.
 
 **For interview framing:** you know Airflow exists, you chose Prefect for MVP because operational simplicity matters for a solo engineer, and you can migrate to Airflow when team scale demands it. That's a stronger answer than "I used Airflow because it's standard."
 
@@ -206,7 +210,7 @@ Your monitoring pipeline has two distinct tracks running on different cadences �
 
 **What:** MLflow tracking server \+ MLflow model registry.
 
-**Why:** MLflow gives you four things you need in one tool: experiment tracking (log metrics per training run), artifact storage (save model files), model versioning (every trained model gets a version), and production tagging (promote a model version to "production" so serving knows what to load). It runs as a lightweight server on your VM with artifact storage pointing to local disk or S3.
+**Why:** MLflow gives you the things you need in one tool: experiment tracking (log metrics per training run), artifact storage (save model files — and, now, dataset snapshots: each dataset-build run logs its train/val/test/baseline parquet and `feature_config.json` as artifacts, so training and validation always agree on exactly which snapshot they're using), model versioning (every trained model gets a version, tagged with the `dataset_version_id` it was trained on), and alias-based promotion (`production` for what's live, `challenger` for a validated candidate not yet live — promoting challenger to production is a separate, not-yet-built deployment step). It runs as a lightweight server on your VM with artifact storage pointing to local disk or S3.
 
 **Specific justification over alternatives:** Weights & Biases requires cloud dependency. SageMaker is AWS lock-in. MLflow is open source, self-hostable, and integrates with scikit-learn and LightGBM in three lines of code.
 
@@ -242,6 +246,8 @@ labels table:
 
 run\_date, pipeline\_type, metric\_name, metric\_value, alert\_triggered
 
+`pipeline_type` now spans six values — `labeling`, `dataset_build`, `training`, `validation`, `pipeline_health` (serving), `data_drift` and `model_perf` (monitoring) — with no schema change required to add the new dataset-build and validation pipelines.
+
 Grafana connects to PostgreSQL directly via its built-in PostgreSQL data source plugin. No Prometheus needed. No separate time-series database. Simple queries, visible dashboards, free.
 
 **Drift detection library:** Evidently AI. Open source, Python-native, produces feature drift reports and data quality reports that you can parse programmatically and log to your metrics table.
@@ -263,7 +269,7 @@ The API does not touch the model. It reads pre-computed scores only.
 
 ### **Containerization — Docker \+ Docker Compose**
 
-**What:** Each pipeline (serving, training, labeling, monitoring) and the API runs in its own Docker container. Docker Compose orchestrates them locally and on the VM.
+**What:** Each pipeline (serving, dataset-build, training, validation, retrain, labeling, monitoring) and the API runs in its own Docker container. Docker Compose orchestrates them locally and on the VM.
 
 **Why:** Solves the "works on my machine" problem. Pins all library versions. Makes deployment to any cloud VM a single command. For CI/CD, your GitHub Actions pipeline builds and pushes the Docker image — the VM pulls and runs it.
 
@@ -271,7 +277,7 @@ The API does not touch the model. It reads pre-computed scores only.
 
 containers:  
   \- kkbox\_postgres          (database)  
-  \- kkbox\_mlflow            (tracking server)  
+  \- kkbox\_mlflow            (tracking server + artifact store — now also holds dataset snapshots)  
   \- kkbox\_api               (FastAPI score API)  
   \- kkbox\_prefect\_worker    (runs all pipeline flows)  
   \- kkbox\_grafana           (dashboard)
@@ -284,7 +290,7 @@ containers:
 
 **Why Railway over GCP/AWS for MVP:** GCP free tier expires, requires billing setup, and has significant configuration overhead. Railway gives you a persistent VM, environment variable management, GitHub integration, and a public URL for your API — in under 30 minutes. When you need to scale, you migrate to GCP or AWS. For MVP demo and interview purposes, Railway is sufficient and honest.
 
-**Compute estimate:** 2 vCPU, 4GB RAM VM is sufficient. Your heaviest job (training) runs monthly and can run overnight.
+**Compute estimate:** 2 vCPU, 4GB RAM VM is sufficient. Your heaviest job (dataset-build + training, back to back) runs monthly and can run overnight.
 
 ---
 
@@ -296,11 +302,11 @@ containers:
 
 ---
 
-### **Event Trigger (Labeling → Monitoring) — Prefect flow dependency**
+### **Event Triggers — Prefect direct subflow calls**
 
-**What:** In Prefect, your monthly labeling flow has a downstream dependency on the monitoring flow. When labeling completes successfully, Prefect automatically triggers the monitoring flow. No separate event bus needed.
+**What:** Two trigger relationships, same mechanism: the monthly labeling flow has a downstream dependency on the monitoring flow, and monitoring's performance track (Track 2) calls the retrain orchestrator directly when AUC-PR falls below threshold — which itself calls the dataset-build, training, and validation flows as subflows in sequence. In Prefect 3.x, calling one `@flow` from inside another creates a traceable child flow run. No separate event bus.
 
-**Why not Kafka or SQS:** you have two pipelines triggering each other once a month. An event queue is massive overengineering for this cadence.
+**Why not Kafka or SQS:** these pipelines trigger each other at most once a day, and the retrain chain only when an alert fires. An event queue is massive overengineering for this cadence.
 
 ---
 
@@ -311,7 +317,7 @@ containers:
 | Source database | PostgreSQL on Docker | Queryable, indexed, handles 20M+ rows, simple |
 | EDA / experimentation | JupyterLab \+ DuckDB | Queries large files without RAM explosion |
 | Pipeline orchestration | Prefect | Python-native, low ops overhead vs Airflow |
-| Experiment tracking | MLflow | Open source, self-hosted, versioning \+ registry |
+| Experiment tracking | MLflow | Open source, self-hosted, versioning \+ registry \+ dataset lineage |
 | Model | LightGBM | Best prior for tabular churn, fast, handles nulls |
 | Prediction \+ label store | PostgreSQL tables | Same instance, low volume, simple queries |
 | Monitoring metrics store | PostgreSQL \+ Evidently | Simple, Grafana-compatible, no extra infra |
@@ -322,7 +328,6 @@ containers:
 | Deployment | Railway free tier | Fast setup, persistent VM, GitHub integration |
 | CI/CD | GitHub Actions | Standard, integrates with Railway and Docker |
 | Programming language | Python 3.10+ | ML standard, all tools have Python SDKs |
-| Event triggering | Prefect flow deps | No event bus needed at this cadence |
+| Event triggering | Prefect direct subflow calls | No event bus needed at this cadence |
 
 ---
-
