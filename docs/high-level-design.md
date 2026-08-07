@@ -65,7 +65,7 @@ Stores every model version with:
 
 Trigger: daily cron.
 
-1. Query transactions for users expiring in 13–15 days.
+1. Query transactions for users expiring in exactly 14 days from `scoring_date`.
 2. Call the feature module per user at `expiry_date - 14 days`.
 3. Load the production model and its `dataset_version_id` tag from the registry.
 4. Fetch `p99_secs` from that dataset's MLflow artifacts — not a local file (see the durability note under Design Decisions Locked).
@@ -73,6 +73,7 @@ Trigger: daily cron.
 6. Apply tier thresholds from config.
 7. Write to the prediction store with a timestamp.
 8. Write to an output file (Parquet/CSV).
+9. Chain the monitoring pipeline's drift track (Track 1), non-fatally, passing the in-memory feature matrix from step 2 — see Monitoring Pipeline below.
 
 #### Prediction Store
 
@@ -82,7 +83,7 @@ Permanent log of every scoring run: `msno`, `score`, `risk_tier`, `scoring_date`
 
 Lightweight REST API. Reads from the prediction store only. Does **not** run the model.
 
-`GET /score/{user_id}` · `GET /cohort/{date}`
+`GET /health` · `GET /score/{user_id}` · `GET /cohort?date=YYYY-MM-DD`
 
 #### Labeling Pipeline (ETL) — `src/pipelines/label.py`
 
@@ -91,13 +92,14 @@ Trigger: monthly, on the 1st (labels for month M-1 now ready).
 1. Query transactions for users whose `anchor_expiry_date` fell in month M-1.
 2. Apply the churn rule: no valid non-cancel transaction within 30 days of expiry.
 3. Write to the label store: `msno`, `anchor_expiry_date`, `feature_cutoff_date`, `is_churn`.
-4. Emit event → triggers the monitoring pipeline.
+
+Not chained to anything downstream — the monitoring pipeline's performance track (Track 2) reads the label store independently on its own monthly trigger, rather than being called from here.
 
 #### Monitoring Pipeline — `src/pipelines/monitor.py`
 
 Two tracks, deliberately kept structurally different — see Design Decisions Locked.
 
-**Track 1 — Data Drift** (ET-shaped: extracts a cohort and transforms it via the feature module, but loads only a metrics row, not a dataset). Runs daily. Resolves the `dataset_version_id` tagged on whichever model currently holds the `production` alias, fetches that dataset's baseline features + `p99_secs` from MLflow (never a local file), calls the feature module on today's serving cohort, computes PSI per feature. Alerts if PSI > threshold.
+**Track 1 — Data Drift** (ET-shaped: extracts a cohort and transforms it via the feature module, but logs a metrics summary, not a dataset). Runs chained onto the serving pipeline's flow in the common case (step 9 above), reusing the feature matrix serve.py already built instead of rebuilding it. Resolves the `dataset_version_id` tagged on whichever model currently holds the `production` alias, fetches that dataset's baseline features + `p99_secs` from MLflow (never a local file), computes PSI per feature against today's serving cohort. Alerts if PSI > threshold. The standalone CLI (`monitor.py drift --date ...`) still rebuilds features via the feature module — used for backfilling a historical date or recovering after a failed serving run.
 
 **Track 2 — Model Performance** (no transform stage at all — it joins already-scored data, it never calls the feature module). Runs monthly. Joins the prediction store (month M-1 predictions) with the label store (month M-1 actuals). Computes AUC-PR, AUC-ROC, Precision@K, Recall@K. Compares against a baseline threshold. If AUC-PR falls below threshold, triggers the **retrain orchestrator** — not the training pipeline directly (see Design Decisions Locked).
 
@@ -130,7 +132,10 @@ RAW TABLES
   → FEATURE MODULE (shared code, called separately here — not a shared dataset)
       → SERVING PIPELINE ← MODEL REGISTRY (production alias + its dataset_version_id)
           → PREDICTION STORE → SCORE API
-              → OUTPUT FILE (Parquet) → MARKETING / CRM
+          → OUTPUT FILE (Parquet) → MARKETING / CRM
+          → MONITORING PIPELINE (Track 1, chained, non-fatal — reuses the
+             in-memory feature matrix above; failure here never blocks
+             predictions already written)
 ```
 
 ---
@@ -142,7 +147,8 @@ RAW TABLES
 | Raw tables | Feature module | Direct query with `msno` + cutoff date | SQL / Pandas |
 | Feature module | Dataset-build pipeline | Feature matrix | DataFrame |
 | Feature module | Serving pipeline | Feature matrix | DataFrame |
-| Feature module | Monitoring pipeline (drift track) | Feature matrix | DataFrame |
+| Feature module | Monitoring pipeline (drift track) | Feature matrix — standalone CLI path only (backfill/recovery) | DataFrame |
+| Serving pipeline | Monitoring pipeline (drift track) | In-memory feature matrix — chained path, the common case | DataFrame, direct Prefect subflow call |
 | Label store | Dataset-build pipeline | Labeled cohort | SQL |
 | Label store | Monitoring pipeline | Actuals for evaluation | SQL |
 | Dataset-build pipeline | MLflow artifacts | train/val/test + baseline features + feature_config, keyed by `dataset_version_id` | Parquet / JSON |
@@ -153,7 +159,7 @@ RAW TABLES
 | Validation pipeline | Model registry | `challenger` alias (only if the candidate wins) | MLflow |
 | Model registry (`production` alias) | Serving pipeline | Production model + its `dataset_version_id` | MLflow |
 | Model registry (`production` alias) + MLflow artifacts | Monitoring pipeline (drift track) | Baseline features + `p99_secs` | Parquet / JSON |
-| Serving pipeline | Prediction store | Scored cohort with metadata | Parquet |
+| Serving pipeline | Prediction store | Scored cohort with metadata | SQL (Postgres) + Parquet (local file) |
 | Prediction store | Score API | Query by `msno` or date | REST / JSON |
 | Prediction store | Monitoring pipeline | Historical predictions | SQL |
 | Monitoring pipeline | Retrain orchestrator | Retraining trigger | Direct Prefect subflow call |
@@ -244,16 +250,17 @@ labels table:
 
 **What:** Every pipeline computes its own metrics (drift PSI, performance AUC-PR/precision/recall, pipeline health cohort size/null rates) and logs them via the Prefect run logger. There is no metrics table and no dashboard — a `monitoring_metrics` PostgreSQL table and a Grafana dashboard on top of it were removed after review found nothing (no automated trigger, no dashboard, no manual query) ever read either back. The retraining trigger in `monitor.py` acts on the in-memory result of the same flow run, not a re-query of anything persisted.
 
-**Drift detection library:** Evidently AI. Open source, Python-native, produces feature drift reports and data quality reports that you can parse programmatically and log.
+**Drift detection library:** Custom PSI, not Evidently. The HLD originally specified Evidently, but the specific requirement — anchoring bin edges to the training distribution so the baseline never shifts — was easier to implement directly (`core/drift_module.py`, ~40 lines) than to configure correctly in Evidently. See README's "Key Decision: PSI Drift Detection Without Evidently" for the full reasoning.
 
 ---
 
 ### **Score API — FastAPI \+ Uvicorn**
 
-**What:** FastAPI application with two endpoints, reading from PostgreSQL prediction store.
+**What:** FastAPI application with three endpoints, reading from PostgreSQL prediction store.
 
 **Why FastAPI:** async support, automatic OpenAPI docs, fast enough for your latency requirement (sub-200ms reads from an indexed PostgreSQL table), minimal boilerplate.
 
+GET /health                 → liveness + DB readiness probe  
 GET /score/{user\_id}        → latest score for a user  
 GET /cohort?date=2017-03-01 → all scores for a scoring date
 
@@ -263,21 +270,25 @@ The API does not touch the model. It reads pre-computed scores only.
 
 ### **Containerization — Docker \+ Docker Compose**
 
-**What:** Each pipeline (serving, dataset-build, training, validation, retrain, labeling, monitoring) and the API runs in its own Docker container. Docker Compose orchestrates them locally and on the VM.
+**What:** The plan — each pipeline (serving, dataset-build, training, validation, retrain, labeling, monitoring) and the API runs in its own Docker container, with Docker Compose orchestrating them locally and on the VM.
 
-**Why:** Solves the "works on my machine" problem. Pins all library versions. Makes deployment to any cloud VM a single command. For CI/CD, your GitHub Actions pipeline builds and pushes the Docker image — the VM pulls and runs it.
+**Current state — not yet built:** Docker Compose today only runs infra (`kkbox_postgres`, `kkbox_mlflow`). Pipelines run as bare `python` processes and the API as bare `uvicorn`, both directly on the host. See README's "What didn't / what's still missing" for why this gap exists and what closing it would take.
 
-**What you containerize:**
+**Why (once built):** Solves the "works on my machine" problem. Pins all library versions. Makes deployment to any cloud VM a single command. For CI/CD, a GitHub Actions pipeline would build and push the Docker image — the VM pulls and runs it.
+
+**What you'd containerize:**
 
 containers:  
-  \- kkbox\_postgres          (database)  
-  \- kkbox\_mlflow            (tracking server + artifact store — now also holds dataset snapshots)  
-  \- kkbox\_api               (FastAPI score API)  
-  \- kkbox\_prefect\_worker    (runs all pipeline flows)
+  \- kkbox\_postgres          (database — built)  
+  \- kkbox\_mlflow            (tracking server + artifact store — built)  
+  \- kkbox\_api               (FastAPI score API — not yet containerized)  
+  \- kkbox\_prefect\_worker    (runs all pipeline flows — not yet containerized)
 
 ---
 
 ### **Deployment — Railway or Render (free tier)**
+
+**Status: not yet built.** No live deployment exists — see README's "What didn't / what's still missing." This section is the plan.
 
 **What:** Single VM on Railway or Render running your Docker Compose stack.
 
@@ -289,15 +300,17 @@ containers:
 
 ### **CI/CD — GitHub Actions**
 
-**What:** On push to main, GitHub Actions runs: tests, builds Docker image, pushes to container registry, deploys to Railway.
+**Status: not yet built.** No `.github/workflows` exist in this repo. This section is the plan.
 
-**Why:** You already chose this. It's correct. Keep it.
+**What:** On push to main, GitHub Actions would run: tests, build Docker image, push to container registry, deploy to Railway.
+
+**Why:** Standard, integrates with Railway and Docker — worth building once there's a deployment target for it to push to.
 
 ---
 
 ### **Event Triggers — Prefect direct subflow calls**
 
-**What:** Two trigger relationships, same mechanism: the monthly labeling flow has a downstream dependency on the monitoring flow, and monitoring's performance track (Track 2) calls the retrain orchestrator directly when AUC-PR falls below threshold — which itself calls the dataset-build, training, and validation flows as subflows in sequence. In Prefect 3.x, calling one `@flow` from inside another creates a traceable child flow run. No separate event bus.
+**What:** Two trigger relationships, same mechanism: the serving pipeline chains the monitoring pipeline's drift track (Track 1) directly onto its own flow, passing the feature matrix it already built in memory; and monitoring's performance track (Track 2) calls the retrain orchestrator directly when AUC-PR falls below threshold — which itself calls the dataset-build, training, and validation flows as subflows in sequence. In Prefect 3.x, calling one `@flow` from inside another creates a traceable child flow run. No separate event bus. The labeling pipeline is *not* chained to anything — Track 2 reads the label store independently on its own monthly trigger.
 
 **Why not Kafka or SQS:** these pipelines trigger each other at most once a day, and the retrain chain only when an alert fires. An event queue is massive overengineering for this cadence.
 
@@ -314,12 +327,12 @@ containers:
 | Model | LightGBM | Best prior for tabular churn, fast, handles nulls |
 | Prediction \+ label store | PostgreSQL tables | Same instance, low volume, simple queries |
 | Monitoring output | Logged via Prefect run output | No persisted store — nothing ever read one back |
-| Drift \+ perf monitoring | Evidently AI | Python-native, open source drift reports |
+| Drift \+ perf monitoring | Custom PSI (`core/drift_module.py`) | Full control over bin-edge anchoring; ~40 lines, no external dependency |
 | Score API | FastAPI \+ Uvicorn | Async, fast, minimal boilerplate |
-| Containerization | Docker \+ Compose | Environment consistency, single-command deploy |
-| Deployment | Railway free tier | Fast setup, persistent VM, GitHub integration |
-| CI/CD | GitHub Actions | Standard, integrates with Railway and Docker |
-| Programming language | Python 3.10+ | ML standard, all tools have Python SDKs |
+| Containerization | Docker \+ Compose (infra only, currently) | Environment consistency, single-command deploy — pipelines/API not yet containerized |
+| Deployment | Railway free tier (planned, not built) | Fast setup, persistent VM, GitHub integration |
+| CI/CD | GitHub Actions (planned, not built) | Standard, integrates with Railway and Docker |
+| Programming language | Python 3.11+ | ML standard, all tools have Python SDKs |
 | Event triggering | Prefect direct subflow calls | No event bus needed at this cadence |
 
 ---

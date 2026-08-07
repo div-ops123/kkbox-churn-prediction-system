@@ -4,6 +4,15 @@ A production-grade churn prediction system built on the [KKBox Music Streaming d
 
 ---
 
+## Demo
+
+<!-- Video walkthrough — replace this comment block with the uploaded video/GIF -->
+<!-- [![Demo video](docs/demo-thumbnail.png)](docs/demo.mp4) -->
+
+*(Video walkthrough coming soon.)*
+
+---
+
 ## The Problem
 
 KKBox loses revenue when subscribers cancel and the business finds out too late to act. Churn prediction needs to be:
@@ -18,7 +27,7 @@ The dataset: 970K users, 8.99% churn rate, 18M+ user log events, transactions th
 
 ## The Solution
 
-An end-to-end ML platform with six production components that mirror real industry architecture:
+An end-to-end ML platform with seven decoupled pipelines that mirror real industry architecture — each independently invocable, chained together only for the common-case flow:
 
 <!-- Architecture diagram: replace this comment block with your architecture image when ready -->
 <!-- ![Architecture Diagram](docs/architecture.png) -->
@@ -28,48 +37,52 @@ DATA SOURCES (PostgreSQL)
 transactions │ user_logs │ members
         │
         ▼
-FEATURE ENGINEERING MODULE  ──────────────────────────────────┐
-core/feature_module.py                                         │
-Single shared library. Called by BOTH training AND serving.   │
-Input: user_id + expiry_date                                   │
-Output: 20-feature vector per user                             │
-        │                                                      │
-        ├──────────────────────────────────────┐              │
-        ▼                                      ▼              │
-TRAINING PIPELINE                    SERVING PIPELINE         │
-pipelines/train.py                   pipelines/serve.py       │
-Trigger: monthly or                  Trigger: daily           │
-perf-triggered                       1. Users expiring        │
-1. Pull labels table                    in 13-15 days         │
-2. Build features                    2. Build features        │
-3. Train LightGBM                    3. Load production model │
-4. Compare vs production             4. Score cohort          │
-5. Promote if better                 5. Apply risk tiers      │
-        │                            6. Write predictions     │
-        ▼                                      │              │
-MODEL REGISTRY (MLflow)              PREDICTION STORE (PG)    │
-All versions + metrics +                       │              │
-production alias                              ▼              │
-                                     SCORE API                │
-                                     FastAPI                  │
-                                     GET /score/{user_id}     │
-                                     GET /cohort?date=...     │
-                                                              │
-LABELING PIPELINE ─────────────────────────────────────────── ┘
-pipelines/label.py
-Monthly: derive is_churn labels from transaction renewals
+FEATURE ENGINEERING MODULE
+core/feature_module.py — single shared library. Called separately by
+the dataset-build pipeline, the serving pipeline, and (on the standalone
+CLI backfill path only) the monitoring pipeline's drift track.
+Input: msno + expiry_date. Output: 20-feature vector per user.
         │
-        ▼
-MONITORING PIPELINE
+        ├─────────────────────────────────┬───────────────────────────┐
+        ▼                                 ▼                           │
+RETRAIN PATH (monthly, or perf-triggered)  SERVING PATH (daily)        │
+pipelines/retrain.py orchestrates:         pipelines/serve.py          │
+                                            1. Users expiring in       │
+1. build_dataset.py — pull labels,            exactly 14 days         │
+   build features, rolling train/val/test   2. Build features         │
+   split, log artifacts to MLflow           3. Load production model  │
+2. train.py — fit LightGBM on train/val,    4. Score cohort           │
+   register a new, unpromoted version       5. Apply risk tiers       │
+3. validate.py — score candidate vs         6. Write predictions      │
+   production on held-out test, alias          (Postgres + Parquet)   │
+   'challenger' if the candidate wins       7. Chain drift check ─────┤
+        │                                      (Track 1, in-memory    │
+        ▼                                      feature matrix,       │
+MODEL REGISTRY (MLflow)                        non-fatal)             │
+versions + metrics +                                │                 │
+production / challenger aliases                     ▼                 │
+                                            PREDICTION STORE (PG)      │
+                                                     │                 │
+                                                     ▼                 │
+                                            SCORE API — FastAPI        │
+                                            GET /health                │
+                                            GET /score/{user_id}       │
+                                            GET /cohort?date=...       │
+                                                                       │
+LABELING PIPELINE (monthly)                                           │
+pipelines/label.py — derive is_churn labels                           │
+from transaction renewals within 30 days                              │
+                                                                       │
+MONITORING PIPELINE ───────────────────────────────────────────────────┘
 pipelines/monitor.py
-Track 1 — Data drift (daily, PSI per feature vs baseline)
-Track 2 — Model performance (monthly, AUC-PR vs threshold)
-Track 3 — Pipeline health (cohort size, null rates)
-        │
-        ▼
-Logged via Prefect run output — no persistence layer.
-The retraining trigger below acts on the in-memory
-perf dict from this same run, not a re-query of anything.
+Track 1 — Data drift: chained onto serve.py's run above in the common
+          case; standalone `monitor.py drift --date` rebuilds features
+          for backfill or recovery after a failed serving run
+Track 2 — Model performance (monthly): joins predictions + labels,
+          triggers pipelines/retrain.py when AUC-PR < threshold
+Track 3 — Pipeline health: computed inline by every pipeline above
+All three tracks: computed and logged via Prefect run output — no
+persistence layer, no dashboard (see Monitoring Strategy below).
 ```
 
 ### Tech Stack
@@ -84,7 +97,7 @@ perf dict from this same run, not a re-query of anything.
 | Prediction store | PostgreSQL table | Same instance as source; low write volume, simple queries |
 | Drift monitoring | Custom PSI (no Evidently) | Full control over bin-edge anchoring and alert logic |
 | Score API | FastAPI + Uvicorn | Async, auto OpenAPI docs, sub-200ms reads from indexed table |
-| Containerization | Docker Compose | Single-command local and cloud deploy |
+| Containerization | Docker Compose (infra only) | Single-command Postgres + MLflow; pipelines/API still run as bare Python processes — see Learnings below |
 
 ### Key Features
 
@@ -113,7 +126,7 @@ perf dict from this same run, not a re-query of anything.
 |---|---|
 | Training cohort size | ~35K verified-anchor users |
 | Serving cohort size (single date, actionable by CRM) | ~2,977 users |
-| Pipelines with retry/alerting | All 4 (label, train, serve, monitor) |
+| Pipelines with retry/alerting | All 6 (build_dataset, label, train, validate, serve, monitor) — retrain.py orchestrates them and inherits their retries |
 | API endpoints | 3 (`/health`, `/score/{user_id}`, `/cohort`) |
 
 **User testimonials:** None yet — this is a pre-launch portfolio project, not a deployed product with users. The honest equivalent at this stage is the monitoring output below: proof the system correctly distinguishes real problems from noise, which is what a CRM team would actually need to trust before acting on its output.
@@ -144,13 +157,13 @@ LightGBM with `scale_pos_weight=10.1` to handle the 8.99% churn class imbalance.
 - **Log/behavioral features** (7): listening days, total seconds, song completion rate, days since last activity
 - **Member features** (5): registration channel, tenure, city
 
-The `p99_secs` winsorization threshold (43,805 sec/day) is computed once from the training distribution and saved to `models/feature_config.json`. The serving pipeline loads this frozen value — recomputing from the serving distribution would silently change the feature scale as listening patterns drift.
+The `p99_secs` winsorization threshold (43,805 sec/day) is computed once from the training distribution by `build_dataset.py` and logged to MLflow as `feature_config.json`, part of the `dataset_build` run's artifacts (see Key Decision: Dataset Storage below). The serving and monitoring pipelines fetch this frozen value from whichever dataset trained the current production model — never a local file, never recomputed from the serving distribution, which would otherwise silently change the feature scale as listening patterns drift.
 
 ### Monitoring Strategy
 
 Three independent tracks in `src/pipelines/monitor.py`, each with its own failure domain:
 
-**Track 1 — Data Drift (daily):** PSI computed for all 20 features against a training baseline saved as `models/baseline_features.parquet`. Bin edges are anchored to the training distribution — never recomputed from serving data. Alert threshold: PSI > 0.2. Log-based features near month-start are expected to alert (structural coverage gap, not model degradation).
+**Track 1 — Data Drift (daily):** PSI computed for all 20 features against `baseline_features.parquet` — an MLflow artifact from the `dataset_build` run that trained the current production model, fetched fresh each run, never a local file. Bin edges are anchored to the training distribution — never recomputed from serving data. Alert threshold: PSI > 0.2. Log-based features near month-start are expected to alert (structural coverage gap, not model degradation).
 
 **Track 2 — Performance (monthly):** Join month-M predictions with month-M labels on `msno`. Compute AUC-PR, AUC-ROC, Precision@100, Recall@100. Alert threshold: AUC-PR < 0.45 triggers automatic retraining via sub-flow call.
 
@@ -260,12 +273,12 @@ All three tracks log to the Prefect run output only — nothing is persisted. `m
 | Airflow | Scheduler + webserver + metadata DB required just to run one DAG | Native — `execution_date`, catchup, and backfill are built-in scheduler concepts | Industry-standard; what most data platform teams run in production |
 | Prefect (what I built) | A plain Python function with `@flow`/`@task` decorators, runnable directly (`python serve.py --date ...`) | Hand-rolled — `scoring_date` param + `--date` CLI flag reimplement a slice of what Airflow gives for free | Smaller ecosystem; the API has changed substantially across major versions (1 → 2 → 3) |
 
-**Decision:** Prefect. Every pipeline (`build_dataset.py`, `train.py`, `validate.py`, `serve.py`, `monitor.py`, `retrain.py`) is a plain Python module decorated with `@flow`/`@task`, runnable directly with no scheduler daemon or metadata DB needed to execute it.
+**Decision:** Prefect. Every pipeline (`label.py`, `build_dataset.py`, `train.py`, `validate.py`, `serve.py`, `monitor.py`, `retrain.py`) is a plain Python module decorated with `@flow`/`@task`, runnable directly with no scheduler daemon or metadata DB needed to execute it.
 
 **Reasoning:** For solo local development, not fighting Airflow's DAG-file/metadata-DB coupling just to test one pipeline change was worth more than Airflow's maturity. That said, this is a dev-ergonomics tradeoff, not a clean architectural win — it holds up less cleanly than "zero infra" makes it sound.
 
 **Tradeoff being accepted:**
-- **The infra saving is temporary, not structural.** It applies to local dev only. The moment these pipelines need to actually run on a schedule — the entire point of `serve.py`/`monitor.py` — Prefect needs a server, a worker, and deployment configs running somewhere, the same category of infra Airflow needs. That cost hasn't been paid yet because the pipelines are decorated but not actually scheduled (see Project Layout notes below).
+- **The infra saving is temporary, not structural.** It applies to local dev only. The moment these pipelines need to actually run on a schedule — the entire point of `serve.py`/`monitor.py` — Prefect needs a server, a worker, and deployment configs running somewhere, the same category of infra Airflow needs. That cost hasn't been paid yet because the pipelines are decorated but not actually scheduled (see "What didn't / what's still missing" above).
 - **Airflow's core idiom is a better fit for what this project reimplements by hand.** `scoring_date` and the `--date` backfill flag are a hand-rolled version of `execution_date`/catchup/backfill — semantics Airflow's scheduler provides natively and has battle-tested for years.
 - **Ecosystem maturity and recognizability.** Airflow is what most data platform teams actually run, and its DAG API has stayed far more stable across major versions than Prefect's (Prefect 1 → 2 → 3 were near-total rewrites). For a project meant to be read by other engineers, that ubiquity carries real legibility value that Prefect's nicer local syntax doesn't offset.
 
@@ -294,7 +307,7 @@ All three tracks log to the Prefect run output only — nothing is persisted. `m
 
 ## Try It
 
-**Live Demo:** `[placeholder — replace with Railway URL after deployment]`
+No live deployment yet — see the Demo section at the top for a video walkthrough. To run it yourself:
 
 ### Local Setup
 
@@ -324,10 +337,15 @@ python db/seed.py
 
 # Run full pipeline cycle
 python src/pipelines/label.py --cohort-month 2017-03
-python src/pipelines/train.py --cohort-months 2017-03
-python src/pipelines/serve.py --date 2017-03-01
-python src/pipelines/monitor.py drift --date 2017-03-01
+
+# build_dataset.py -> train.py -> validate.py, chained by retrain.py
+python src/pipelines/retrain.py --cohort-months 2017-03
+
+python src/pipelines/serve.py --date 2017-03-01   # also chains drift monitoring (Track 1)
 python src/pipelines/monitor.py performance --cohort-month 2017-03
+
+# Optional: backfill/re-run drift monitoring for a specific date standalone
+python src/pipelines/monitor.py drift --date 2017-03-01
 
 # Start Score API
 uvicorn src.api.main:app --reload --port 8000
@@ -355,14 +373,18 @@ src/
 ├── core/                   — pure domain logic (no Prefect, no psycopg2)
 │   ├── feature_module.py   — build_features(), FEATURE_COLS, CAT_COLS
 │   ├── label_module.py     — build_cohort(), compute_labels()
-│   ├── drift_module.py     — compute_psi(), evaluate_cohort_performance()
+│   ├── drift_module.py     — compute_feature_drift(), evaluate_cohort_performance()
+│   ├── model_trainer.py    — train_lgbm(), split_cohort_3way(), compute_p99_secs()
 │   ├── model_loader.py     — make_model_loader() factory
 │   └── risk_tier.py        — make_tier_strategy() factory
 ├── pipelines/              — Prefect @flow + @task, CLI entry points
 │   ├── label.py            — monthly labeling pipeline
-│   ├── train.py            — monthly training + model promotion
-│   ├── serve.py            — daily scoring pipeline
-│   └── monitor.py          — drift + performance + health monitoring
+│   ├── build_dataset.py    — labeled cohort → features → train/val/test split → MLflow
+│   ├── train.py            — fit LightGBM on an already-built dataset, register unpromoted
+│   ├── validate.py         — score candidate vs production on held-out test, alias challenger
+│   ├── retrain.py          — thin orchestrator: build_dataset → train → validate
+│   ├── serve.py            — daily scoring pipeline, chains drift monitoring
+│   └── monitor.py          — drift (Track 1) + performance (Track 2) monitoring
 ├── experiments/            — one-off baseline scripts (not the production path)
 │   ├── build_training_set.py — cohort selection + label join, writes train_features.parquet
 │   └── train_baseline.py     — train LightGBM baseline
