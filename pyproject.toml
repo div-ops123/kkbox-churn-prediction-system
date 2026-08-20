@@ -19,4 +19,5 @@ dependencies = [
     "uvicorn[standard]>=0.47.0",
     "prefect>=3.7.1",
     "python-dotenv>=1.2.2",
+    "seaborn>=0.13.2",
 ]
