@@ -5,7 +5,7 @@ This pipeline does not touch raw data, the labels table, or feature
 computation — all of that is the dataset-build pipeline's job
 (pipelines/build_dataset.py). This pipeline fetches train.parquet and
 val.parquet for a given dataset_version_id (the dataset-build MLflow run_id),
-fits LightGBM, and registers the result to MLflow.
+fits XGBoost, and registers the result to MLflow.
 
 It never promotes anything: it always registers a new model version (so it
 exists with a version number and can be inspected/loaded), tags it with the
@@ -20,8 +20,8 @@ Run locally:
 Parameters
 ----------
 dataset_version_id    : MLflow run_id of the dataset-build run to train on.
-n_estimators          : LightGBM boosting rounds ceiling (early stopping applies).
-early_stopping_rounds : LightGBM early stopping patience.
+n_estimators          : XGBoost boosting rounds ceiling (early stopping applies).
+early_stopping_rounds : XGBoost early stopping patience.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ import tempfile
 from pathlib import Path
 
 import mlflow
-import mlflow.lightgbm
+import mlflow.xgboost
 import pandas as pd
 from mlflow import MlflowClient
 from prefect import flow, get_run_logger, task
@@ -41,7 +41,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import TrainingConfig, load_training_config
-from core.model_trainer import TrainArtifact, _auto_scale_pos_weight, train_lgbm
+from core.model_trainer import TrainArtifact, _auto_scale_pos_weight, train_xgb
 
 
 # ── Custom exceptions ──────────────────────────────────────────────────────────
@@ -50,7 +50,7 @@ class DatasetLoadError(Exception):
     """Failed to fetch the dataset-build artifacts for dataset_version_id."""
 
 class ModelTrainingError(Exception):
-    """LightGBM training or evaluation failed."""
+    """XGBoost training or evaluation failed."""
 
 class MLflowRegistrationError(Exception):
     """MLflow logging or model registration failed."""
@@ -61,12 +61,13 @@ class MLflowRegistrationError(Exception):
 @task(name="load-dataset-artifacts", retries=2, retry_delay_seconds=30, tags=["mlflow", "dataset"])
 def load_dataset_artifacts(
     dataset_version_id: str, config: TrainingConfig
-) -> tuple[pd.DataFrame, pd.DataFrame, float]:
+) -> tuple[pd.DataFrame, pd.DataFrame, float, dict[str, list]]:
     """
-    Fetch train.parquet, val.parquet, and feature_config.json (for p99_secs)
-    from the dataset-build MLflow run identified by dataset_version_id.
+    Fetch train.parquet, val.parquet, and feature_config.json (for p99_secs
+    and the frozen CAT_COLS category lists) from the dataset-build MLflow run
+    identified by dataset_version_id.
 
-    Returns (train_df, val_df, p99_secs).
+    Returns (train_df, val_df, p99_secs, cat_categories).
     """
     logger = get_run_logger()
     mlflow.set_tracking_uri(config.mlflow.tracking_uri)
@@ -80,7 +81,9 @@ def load_dataset_artifacts(
             val_df = pd.read_parquet(Path(local_dir) / "val.parquet")
             import json
             with open(Path(local_dir) / "feature_config.json") as f:
-                p99_secs = json.load(f)["p99_secs"]
+                feature_config = json.load(f)
+                p99_secs = feature_config["p99_secs"]
+                cat_categories = feature_config["cat_categories"]
     except Exception as exc:
         raise DatasetLoadError(
             f"Failed to load dataset artifacts for dataset_version_id={dataset_version_id}: {exc}"
@@ -95,7 +98,7 @@ def load_dataset_artifacts(
         f"load_dataset_artifacts complete | dataset_version_id={dataset_version_id}"
         f" | n_train={len(train_df)} | n_val={len(val_df)} | p99_secs={p99_secs:,.1f}"
     )
-    return train_df, val_df, p99_secs
+    return train_df, val_df, p99_secs, cat_categories
 
 
 @task(name="train-candidate-model", retries=0, tags=["training"])
@@ -103,10 +106,11 @@ def train_candidate_model(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     p99_secs: float,
+    cat_categories: dict[str, list],
     config: TrainingConfig,
 ) -> TrainArtifact:
     """
-    Fit LightGBM on train_df, early-stopping against val_df.
+    Fit XGBoost on train_df, early-stopping against val_df.
 
     retries=0 — training is deterministic; a crash is a code bug.
     """
@@ -118,15 +122,16 @@ def train_candidate_model(
             f"train_candidate_model | n_train={len(train_df)} | n_val={len(val_df)}"
             f" | scale_pos_weight={scale_pos:.2f}"
         )
-        artifact = train_lgbm(
+        artifact = train_xgb(
             train_df, val_df,
             scale_pos_weight=scale_pos,
+            cat_categories=cat_categories,
             n_estimators=config.n_estimators,
             early_stopping_rounds=config.early_stopping_rounds,
             p99_secs=p99_secs,
         )
     except Exception as exc:
-        raise ModelTrainingError(f"LightGBM training failed: {exc}") from exc
+        raise ModelTrainingError(f"XGBoost training failed: {exc}") from exc
 
     logger.info(
         f"train_candidate_model complete"
@@ -175,7 +180,7 @@ def register_to_mlflow(
                 "recall_at_100":      candidate.recall_at_k,
                 "churn_rate_train":   candidate.churn_rate_train,
             })
-            mlflow.lightgbm.log_model(candidate.booster, artifact_path="model")
+            mlflow.xgboost.log_model(candidate.booster, artifact_path="model")
             run_id = run.info.run_id
 
         model_uri = f"runs:/{run_id}/model"
@@ -224,7 +229,7 @@ def log_training_metrics(candidate: TrainArtifact, run_id: str) -> None:
 @flow(
     name="kkbox-training-pipeline",
     description=(
-        "Fit a candidate LightGBM model on an already-built dataset "
+        "Fit a candidate XGBoost model on an already-built dataset "
         "(see pipelines/build_dataset.py) and register it to MLflow, "
         "unpromoted."
     ),
@@ -261,13 +266,14 @@ def run_training_pipeline(
     )
 
     # ── Step 1: Fetch dataset ──────────────────────────────────────────────────
-    train_df, val_df, p99_secs = load_dataset_artifacts(
+    train_df, val_df, p99_secs, cat_categories = load_dataset_artifacts(
         dataset_version_id=dataset_version_id, config=config
     )
 
     # ── Step 2: Train candidate ───────────────────────────────────────────────
     candidate = train_candidate_model(
-        train_df=train_df, val_df=val_df, p99_secs=p99_secs, config=config
+        train_df=train_df, val_df=val_df, p99_secs=p99_secs,
+        cat_categories=cat_categories, config=config,
     )
 
     # ── Step 3: Register to MLflow (never promoted) ──────────────────────────

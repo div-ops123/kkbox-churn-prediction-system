@@ -16,7 +16,7 @@ Notes:
     on real anchors removes a train/serve skew the fallback used to introduce.
     This is a deliberate experiment, not an assumption that it outperforms the
     full-cohort+fallback approach — validate both on the same held-out set.
-  - LightGBM handles NaN natively; do NOT fill NaN with 0
+  - XGBoost handles NaN natively; do NOT fill NaN with 0
 """
 
 import json
@@ -27,7 +27,7 @@ import pandas as pd
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core.feature_module import build_features
+from core.feature_module import CAT_COLS, build_features, freeze_cat_categories
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA     = BASE_DIR / "data"
@@ -90,6 +90,14 @@ features_df = build_features(
     data_dir     = DATA,
 )
 print(f"  feature matrix: {features_df.shape[0]:,} rows x {features_df.shape[1]} cols")
+
+# Freeze CAT_COLS category lists now that features are built — must be persisted
+# alongside p99_secs so train_baseline.py (and serve.py's --no-mlflow fallback)
+# apply the exact same categorical encoding XGBoost was fit on.
+cat_categories = freeze_cat_categories(features_df, CAT_COLS)
+with open(_config_path, "w") as _f:
+    json.dump({"p99_secs": float(p99_secs), "cat_categories": cat_categories}, _f, indent=2)
+print(f"  Updated feature_config.json with cat_categories -> {_config_path}")
 
 # ── Stage 4: Join labels/metadata and export ─────────────────────────────────
 print("Stage 4: joining labels and exporting...")

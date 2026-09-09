@@ -25,8 +25,8 @@ from typing import Any, Protocol, runtime_checkable
 class ScoringModel(Protocol):
     """
     Structural protocol — any object that can produce churn scores.
-    LightGBM Booster uses predict(); sklearn-style wrappers use predict_proba().
-    Both are accepted; score_cohort() handles the dispatch.
+    Raw boosters use predict(); sklearn-style wrappers (e.g. XGBClassifier)
+    use predict_proba(). Both are accepted; score_cohort() handles the dispatch.
     """
 
     def predict(self, X: Any) -> Any: ...
@@ -75,7 +75,7 @@ class MLflowModelLoader(BaseModelLoader):
     def load(self) -> ScoringModel:
         try:
             import mlflow
-            import mlflow.lightgbm
+            import mlflow.xgboost
             from mlflow.exceptions import MlflowException
         except ImportError as exc:
             raise ModelLoadError("mlflow is not installed") from exc
@@ -94,7 +94,7 @@ class MLflowModelLoader(BaseModelLoader):
         self._dataset_version_id = mv.tags.get("dataset_version_id")
         model_uri = f"models:/{self._model_name}/{mv.version}"
         try:
-            model = mlflow.lightgbm.load_model(model_uri)
+            model = mlflow.xgboost.load_model(model_uri)
         except Exception as exc:
             raise ModelLoadError(
                 f"Failed to load model from {model_uri}: {exc}"

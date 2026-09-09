@@ -1,8 +1,8 @@
 """
-LightGBM churn prediction — baseline model.
+XGBoost churn prediction — baseline model.
 
 Input:  data/train_features.parquet   (produced by src/experiments/build_training_set.py)
-Output: models/lgbm_baseline.pkl
+Output: models/xgb_baseline.pkl
         mlflow.db                      (MLflow experiment log, project root)
 
 Run (from project root):
@@ -17,10 +17,10 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import mlflow
-import mlflow.lightgbm
+import mlflow.xgboost
 from mlflow import MlflowClient
 import pandas as pd
-import lightgbm as lgb
+import xgboost as xgb
 from dotenv import load_dotenv
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score, roc_auc_score
@@ -52,6 +52,7 @@ print(f"Churn rate: {df['is_churn'].mean():.4%}  "
 
 with open(FEATURE_CFG) as _f:
     feature_config = json.load(_f)
+cat_categories = feature_config["cat_categories"]
 print(f"Feature config loaded: p99_secs={feature_config['p99_secs']:,.0f}")
 # %%
 
@@ -73,9 +74,11 @@ print(f"Feature config loaded: p99_secs={feature_config['p99_secs']:,.0f}")
 #     cutoff — so nothing qualifies as "prior history" in the window.
 #     => Imputing 0 would wrongly encode "zero activity" for users whose real
 #        history simply hasn't happened yet as of the 14-day-early cutoff.
-#        LightGBM's NaN routing learns that NULL here means "no qualifying
-#        transaction before cutoff" — a real feature-cutoff mechanic, not a
-#        dataset artifact, but still not equivalent to "zero engagement."
+#        XGBoost's native missing-value routing (a learned default split
+#        direction, same principle as LightGBM's, different mechanism) learns
+#        that NULL here means "no qualifying transaction before cutoff" — a
+#        real feature-cutoff mechanic, not a dataset artifact, but still not
+#        equivalent to "zero engagement."
 #
 #   CAUSE B  log coverage gap — engagement features (~52.3% null)
 #     user_logs.csv only covers March 1-31, 2017. Anchored users whose
@@ -89,14 +92,14 @@ print(f"Feature config loaded: p99_secs={feature_config['p99_secs']:,.0f}")
 #     user's own feature_cutoff_dt (future/invalid dates). These are excluded
 #     from tenure_days per EDA decisions (Error 4, docs/dataset_overview.md).
 #     => This IS a genuine data quality issue that could persist in production.
-#        Still no imputation: LightGBM will learn the null pattern if it
+#        Still no imputation: XGBoost will learn the null pattern if it
 #        correlates with churn; imputing the mean would destroy that signal.
 #
 # The goal of this project is to demonstrate model-building judgment and
 # awareness of dataset limitations. The high null rates do not invalidate
 # the model — they are fully expected given the extract and the 14-day
-# cutoff rule, and LightGBM's native NaN handling is the correct approach
-# for all three causes.
+# cutoff rule, and XGBoost's native missing-value handling is the correct
+# approach for all three causes.
 
 # %%
 FEATURE_GROUPS = {
@@ -149,10 +152,12 @@ df.head()
 
 # %%
 # ── 3. Feature matrix ─────────────────────────────────────────────────────────
-# has_log_data excluded: redundant with log feature nulls (LightGBM sees NaN).
+# has_log_data excluded: redundant with log feature nulls (XGBoost sees NaN).
 # (has_anchor no longer exists — training is anchored-only now, see build_training_set.py)
 
-X = df[FEATURE_COLS]
+X = df[FEATURE_COLS].copy()
+for _col in CAT_COLS:
+    X[_col] = pd.Categorical(X[_col], categories=cat_categories[_col])
 y = df["is_churn"]
 
 # %%
@@ -166,49 +171,42 @@ print(f"\nTrain: {len(X_train):,}  |  Val: {len(X_val):,}")
 print(f"Train churn: {y_train.mean():.4%}  |  Val churn: {y_val.mean():.4%}")
 
 # %%
-# ── 5. LightGBM baseline ──────────────────────────────────────────────────────
-scale_pos = (y == 0).sum() / (y == 1).sum()   # ≈ 10.1
+# ── 5. XGBoost baseline ───────────────────────────────────────────────────────
+scale_pos = (y == 0).sum() / (y == 1).sum()
 
+# Remapped from the project's original LightGBM params — see model_trainer.py's
+# _xgb_params() docstring for why these aren't 1:1 renames (num_leaves ->
+# max_leaves + grow_policy, min_child_samples -> min_child_weight has different
+# semantics, bagging_fraction/bagging_freq -> subsample with no frequency knob).
 params = {
-    "objective":         "binary",
-    "metric":            "average_precision",   # AUC-PR — primary metric
-    "scale_pos_weight":  scale_pos,
-    "learning_rate":     0.05,
-    "num_leaves":        63,
-    "min_child_samples": 20,
-    "feature_fraction":  0.8,
-    "bagging_fraction":  0.8,
-    "bagging_freq":      5,
-    "verbosity":         -1,
-    "random_state":      42,
+    "objective":          "binary:logistic",
+    "eval_metric":        "aucpr",   # AUC-PR — primary metric
+    "scale_pos_weight":   scale_pos,
+    "learning_rate":      0.05,
+    "tree_method":        "hist",
+    "grow_policy":        "lossguide",
+    "max_leaves":         63,
+    "colsample_bytree":   0.8,
+    "subsample":          0.8,
+    "enable_categorical": True,
+    "verbosity":          0,
+    "random_state":       42,
 }
 
 print(f"\nscale_pos_weight = {scale_pos:.2f}  (retained:churned ratio)")
-print("Training LightGBM (early stopping on val AUC-PR)...\n")
+print("Training XGBoost (early stopping on val AUC-PR)...\n")
 
-mlflow.lightgbm.autolog()
+mlflow.xgboost.autolog()
 
-ds_train = lgb.Dataset(X_train, label=y_train, categorical_feature=CAT_COLS, free_raw_data=False)
-ds_val   = lgb.Dataset(X_val,   label=y_val,   categorical_feature=CAT_COLS,
-                        reference=ds_train,     free_raw_data=False)
-
-with mlflow.start_run(run_name="lgbm_baseline"):
+with mlflow.start_run(run_name="xgb_baseline"):
 
     mlflow.log_artifact(str(FEATURE_CFG), artifact_path="feature_config")
 
-    model = lgb.train(
-        params,
-        ds_train,
-        num_boost_round=1000,
-        valid_sets=[ds_val],
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=50, verbose=True),
-            lgb.log_evaluation(period=100),
-        ],
-    )
+    model = xgb.XGBClassifier(**params, n_estimators=1000, early_stopping_rounds=50)
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=100)
 
     # ── 6. Evaluate ───────────────────────────────────────────────────────────
-    y_score = model.predict(X_val)
+    y_score = model.predict_proba(X_val)[:, 1]
 
     auc_pr  = average_precision_score(y_val, y_score)
     auc_roc = roc_auc_score(y_val, y_score)
@@ -235,11 +233,20 @@ with mlflow.start_run(run_name="lgbm_baseline"):
     print(f"Recall@{TOP_K:<7} = {recall_at_k:.4f}  "
           f"(top-{TOP_K} contacts capture {recall_at_k:.2%} of all churners in val set)")
 
-    # Feature importance — what the model actually learned from
-    fi = pd.DataFrame({
-        "feature":    model.feature_name(),
-        "importance": model.feature_importance(importance_type="gain"),
-    }).sort_values("importance", ascending=False).reset_index(drop=True)
+    # Feature importance — what the model actually learned from.
+    # XGBoost's get_score() returns a dict keyed by feature name (not two
+    # parallel arrays like LightGBM's feature_name()/feature_importance()),
+    # and silently omits any feature that was never split on — reindex against
+    # FEATURE_COLS so those still show up (at importance 0).
+    gain = model.get_booster().get_score(importance_type="gain")
+    fi = (
+        pd.Series(gain, name="importance")
+        .reindex(FEATURE_COLS, fill_value=0.0)
+        .rename_axis("feature")
+        .reset_index()
+        .sort_values("importance", ascending=False)
+        .reset_index(drop=True)
+    )
     print("\nFeature importance (gain):")
     print(fi.to_string(index=False))
 
@@ -248,7 +255,7 @@ with mlflow.start_run(run_name="lgbm_baseline"):
 
     # ── 7. Save ───────────────────────────────────────────────────────────────
     MODELS.mkdir(exist_ok=True)
-    out = MODELS / "lgbm_baseline.pkl"
+    out = MODELS / "xgb_baseline.pkl"
     with open(out, "wb") as f:
         pickle.dump(model, f)
     print(f"\nModel saved to {out}")
@@ -260,7 +267,7 @@ model_uri = f"runs:/{mlflow.last_active_run().info.run_id}/model"
 print(model_uri)
 
 # === only register after confirmation model metrics is good
-# mv = mlflow.register_model(model_uri=model_uri, name="LightGBMChurnClassifier")
+# mv = mlflow.register_model(model_uri=model_uri, name="ChurnClassifier")
 
 
 # # Initialize the MLflow client

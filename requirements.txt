@@ -870,14 +870,6 @@ lark==1.3.1 \
     --hash=sha256:b426a7a6d6d53189d318f2b6236ab5d6429eaf09259f1ca33eb716eed10d2905 \
     --hash=sha256:c629b661023a014c37da873b4ff58a817398d12635d3bbb2c5a03be7fe5d1e12
     # via rfc3987-syntax
-lightgbm==4.6.0 \
-    --hash=sha256:2dafd98d4e02b844ceb0b61450a660681076b1ea6c7adb8c566dfd66832aafad \
-    --hash=sha256:37089ee95664b6550a7189d887dbf098e3eadab03537e411f52c63c121e3ba4b \
-    --hash=sha256:4d68712bbd2b57a0b14390cbf9376c1d5ed773fa2e71e099cac588703b590336 \
-    --hash=sha256:b7a393de8a334d5c8e490df91270f0763f83f959574d504c7ccb9eee4aef70ed \
-    --hash=sha256:cb19b5afea55b5b61cbb2131095f50538bd608a00655f23ad5d25ae3e3bf1c8d \
-    --hash=sha256:cb1c59720eb569389c0ba74d14f52351b573af489f230032a1c9f314f8bab7fe
-    # via kkbox-churn
 mako==1.3.12 \
     --hash=sha256:8f61569480282dbf557145ce441e4ba888be453c30989f879f0d652e39f53ea9 \
     --hash=sha256:9f778e93289bd410bb35daadeb4fc66d95a746f0b75777b942088b7fd7af550a
@@ -942,6 +934,7 @@ matplotlib==3.10.9 \
     # via
     #   kkbox-churn
     #   mlflow
+    #   seaborn
 matplotlib-inline==0.2.2 \
     --hash=sha256:3c821cf1c209f59fb2d2d64abbf5b23b67bcb2210d663f9918dd851c6da1fcf6 \
     --hash=sha256:72f3fe8fce36b70d4a5b612f899090cd0401deddc4ea90e1572b9f4bfb058c79
@@ -1074,13 +1067,22 @@ numpy==2.4.4 \
     --hash=sha256:fcfe2045fd2e8f3cb0ce9d4ba6dba6333b8fa05bb8a4939c908cd43322d14c7e
     # via
     #   contourpy
-    #   lightgbm
     #   matplotlib
     #   mlflow
     #   pandas
     #   scikit-learn
     #   scipy
+    #   seaborn
     #   skops
+    #   xgboost
+nvidia-nccl-cu12==2.31.2 ; python_full_version < '3.12' and sys_platform == 'linux' \
+    --hash=sha256:f208de397e431631eab0eca946444404a495d43a007535baa333d7de9e510ca2 \
+    --hash=sha256:f9b1dc3c2a7e20176054144ebb3b32fea83b40402ee5d7ac7045cd11ecc956c0
+    # via xgboost
+nvidia-nccl-cu13==2.31.2 ; python_full_version >= '3.12' and sys_platform == 'linux' \
+    --hash=sha256:0bcaf0308854cb55fcc35af72e2c83143f3b71e65a4e865e2c586b1cdcdb5ae0 \
+    --hash=sha256:b5563f8e2534f363d93ace022670ba016d3717e190ac4eba564d05fbbe8495b1
+    # via xgboost
 oauthlib==3.3.1 \
     --hash=sha256:0f0f8aa759826a193cf66c12ea1af1637f87b9b4622d46e866952bb022e538c9 \
     --hash=sha256:88119c938d2b8fb88561af5f6ee0eec8cc8d552b7bb1f712743136eb7523b7a1
@@ -1183,6 +1185,7 @@ pandas==2.3.3 \
     # via
     #   kkbox-churn
     #   mlflow
+    #   seaborn
 pandocfilters==1.5.1 \
     --hash=sha256:002b4a555ee4ebc03f8b66307e287fa492e4a77b4ea14d3f934328297bb4939e \
     --hash=sha256:93be382804a9cdb0a7267585f157e5d1731bbe5545a85b268d6f5fe6232de2bc
@@ -1840,10 +1843,14 @@ scipy==1.17.1 \
     --hash=sha256:f590cd684941912d10becc07325a3eeb77886fe981415660d9265c4c418d0bea \
     --hash=sha256:fcb310ddb270a06114bb64bbe53c94926b943f5b7f0842194d585c65eb4edd76
     # via
-    #   lightgbm
     #   mlflow
     #   scikit-learn
     #   skops
+    #   xgboost
+seaborn==0.13.2 \
+    --hash=sha256:636f8336facf092165e27924f223d3c62ca560b1f2bb5dff7ab7fad265361987 \
+    --hash=sha256:93e60a40988f4d65e9f4885df477e2fdaff6b73a9ded434c1ab356dd57eefff7
+    # via kkbox-churn
 semver==3.0.4 \
     --hash=sha256:9c824d87ba7f7ab4a1890799cec8596f15c1241cb473404ea1cb0c55e4b04746 \
     --hash=sha256:afc7d8c584a5ed0a11033af086e8af226a9c0b206f313e0301f8dd7b6b589602
@@ -2161,6 +2168,23 @@ widgetsnbextension==4.0.15 \
     --hash=sha256:8156704e4346a571d9ce73b84bee86a29906c9abfd7223b7228a28899ccf3366 \
     --hash=sha256:de8610639996f1567952d763a5a41af8af37f2575a41f9852a38f947eb82a3b9
     # via ipywidgets
+xgboost==3.2.0 ; python_full_version < '3.12' \
+    --hash=sha256:0d169736fd836fc13646c7ab787167b3a8110351c2c6bc770c755ee1618f0442 \
+    --hash=sha256:2f661966d3e322536d9c448090a870fcba1e32ee5760c10b7c46bac7a342079a \
+    --hash=sha256:852eabc6d3b3702a59bf78dbfdcd1cb9c4d3a3b6e5ed1f8781d8b9512354fdd2 \
+    --hash=sha256:99b0e9a2a64896cdaf509c5e46372d336c692406646d20f2af505003c0c5d70d \
+    --hash=sha256:99b4a6bbcb47212fec5cf5fbe12347215f073c08967431b0122cfbd1ee70312c \
+    --hash=sha256:eabbd40d474b8dbf6cb3536325f9150b9e6f0db32d18de9914fb3227d0bef5b7
+    # via kkbox-churn
+xgboost==3.4.1 ; python_full_version >= '3.12' \
+    --hash=sha256:1ea15f15f661825b6a67d87674fb9604a1abb38dd0d4c5cf0486fc85f5203e83 \
+    --hash=sha256:2d30fa513673101f542fdcbd18f30c8f96c064046f798635ac08663e9969f81b \
+    --hash=sha256:6968a4c71efdfa859df0dfcad0d99211c95c28c4ffd6aecff46efff77d18026a \
+    --hash=sha256:6adf2afa396da2ae8ed30295b50b99d4712eed9a6e0ce6cfe069290e4335e51f \
+    --hash=sha256:7faaf99de26719c22bfae883a02bd56b5a3c2203122616e563cc72b7191b5c96 \
+    --hash=sha256:a7afd7dbace0951c93aa85ffe046e54bc40893f5b51cd3e7991eb157bf9c7c7c \
+    --hash=sha256:e9312b30e5679d27c1d8b9ee97e092b964d960a672d5d406d9fb3cd0845c9797
+    # via kkbox-churn
 yarl==1.23.0 \
     --hash=sha256:03214408cfa590df47728b84c679ae4ef00be2428e11630277be0727eba2d7cc \
     --hash=sha256:0e40111274f340d32ebcc0a5668d54d2b552a6cca84c9475859d364b380e3222 \

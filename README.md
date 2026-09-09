@@ -51,7 +51,7 @@ pipelines/retrain.py orchestrates:         pipelines/serve.py          │
 1. build_dataset.py — pull labels,            exactly 14 days         │
    build features, rolling train/val/test   2. Build features         │
    split, log artifacts to MLflow           3. Load production model  │
-2. train.py — fit LightGBM on train/val,    4. Score cohort           │
+2. train.py — fit XGBoost on train/val,     4. Score cohort           │
    register a new, unpromoted version       5. Apply risk tiers       │
 3. validate.py — score candidate vs         6. Write predictions      │
    production on held-out test, alias          (Postgres + Parquet)   │
@@ -93,7 +93,7 @@ persistence layer, no dashboard (see Monitoring Strategy below).
 | Feature engineering | DuckDB (inside Python) | Queries CSVs + Postgres without loading into RAM |
 | Pipeline orchestration | Prefect | Python-native `@flow`/`@task`, simpler for solo local iteration than standing up Airflow's scheduler/webserver/metadata DB — trade-off below |
 | Experiment tracking | MLflow | Self-hosted, open source; covers tracking + registry + promotion in one tool |
-| Model | LightGBM | Native null handling, fast training, well-calibrated probabilities for risk tiers |
+| Model | XGBoost | Native null handling, no inference-speed pressure since scoring is a daily batch job, higher tuning ceiling than RandomForest for this ranking task |
 | Prediction store | PostgreSQL table | Same instance as source; low write volume, simple queries |
 | Drift monitoring | Custom PSI (no Evidently) | Full control over bin-edge anchoring and alert logic |
 | Score API | FastAPI + Uvicorn | Async, auto OpenAPI docs, sub-200ms reads from indexed table |
@@ -114,24 +114,28 @@ persistence layer, no dashboard (see Monitoring Strategy below).
 
 | Metric | Value |
 |---|---|
-| AUC-PR | **0.976** |
-| AUC-ROC | 0.816 |
+| AUC-PR | **0.979** |
+| AUC-ROC | 0.833 |
 | Precision@K (K=100) | 1.0 |
 | Recall@K (K=100) | 0.021 |
 | Features engineered | 20 (transaction, log, member) |
 | Feature training-serving skew | **Zero** — single shared module |
 
+**What this proves:** this table exists to show the ranking mechanism works, not to claim a business outcome. n=5,328 spans mixed expiry dates across the training cohort — it's not a real single-day CRM batch, so "Precision@100 = 1.0" doesn't map to "we contacted 100 real people and got 100% right." What it does show: given a ranked list, the model can put 100 true churners at the very top with zero false positives (Precision@100=1.0) before recall inevitably stays low (Recall@100=0.021) simply because 100 is a small slice of a 5,328-user test set. K=100 here is illustrative, not a calibrated capacity figure — see the production table below for the number that actually corresponds to a real day's outreach batch.
+
 **Technical metrics — production cohort** (`monitor.py performance`, actual scored predictions joined against actual labels, cohort_month=2017-03, n=1,055, all expiring 2017-03-15):
 
 | Metric | Value |
 |---|---|
-| AUC-PR | 0.870 |
-| AUC-ROC | 0.490 |
-| Precision@K (K=100) | 0.90 |
-| Recall@K (K=100) | 0.098 |
+| AUC-PR | 0.859 |
+| AUC-ROC | 0.467 |
+| Precision@K (K=100) | 0.86 |
+| Recall@K (K=100) | 0.094 |
 | Churn rate in this cohort | 86.7% (915 of 1,055) |
 
-This cohort is far more churn-heavy (86.7%) than the training population (90.5% among the 35,518 confirmed-anchor users, 8.99% in KKBox's raw dataset) because it's a single day's worth of expiring users, not a representative sample. At that base rate, a classifier outputting random scores would already land near 0.87 AUC-PR, and AUC-ROC on a cohort this lopsided is close to uninformative — 0.49 here reflects the cohort's composition, not the model's ranking ability. The held-out test set above (mixed expiry dates) is the more meaningful accuracy signal; this table exists to show what Track 2 actually reports in production, caveats included.
+This cohort is even more churn-heavy (86.7%) than the already-imbalanced training population (90.5% among the 35,518 confirmed-anchor users, vs. 8.99% in KKBox's raw, unfiltered dataset) because it's a single day's worth of expiring users, not a representative sample. At that base rate, a classifier outputting random scores would already land near 0.87 AUC-PR, and AUC-ROC on a cohort this lopsided is close to uninformative — 0.467 here reflects the cohort's composition, not the model's ranking ability. The held-out test set above (mixed expiry dates) is the more meaningful accuracy signal.
+
+**What this means for the business:** this table is what CRM would actually see on a real day, and it's the one worth translating into plain terms. Of the 1,055 subscribers expiring 2017-03-15, 915 are genuinely at risk of churning. The model's top-100 ranked list (K=100 is illustrative here, not a confirmed CRM daily capacity — see note above) catches 86 of them (Recall@100=0.094, ≈9.4% of that day's at-risk subscribers reached) and 86 of those 100 contacts are correct (Precision@100=0.86) — so a retention team acting on this list mostly isn't spending outreach budget on subscribers who weren't going to leave anyway. This table also exists for a second reason: it's what `monitor.py performance` computes automatically every month in production — it's Track 2's ongoing health check, not a one-off accuracy claim. If AUC-PR on a real monthly cohort like this one ever drops below a configured threshold, the system auto-triggers a full retrain-and-validate pipeline (see Monitoring Strategy below) — this table is a snapshot of that watchdog doing its job, not a second measurement of "is the model good."
 
 **Business-relevant metrics:**
 
@@ -142,7 +146,7 @@ This cohort is far more churn-heavy (86.7%) than the training population (90.5% 
 | Pipelines with retry/alerting | All 6 (build_dataset, label, train, validate, serve, monitor) — retrain.py orchestrates them and inherits their retries |
 | API endpoints | 3 (`/health`, `/score/{user_id}`, `/cohort`) |
 
-**User testimonials:** None yet — this is a pre-launch portfolio project, not a deployed product with users. The honest equivalent at this stage is the monitoring output below: proof the system correctly distinguishes real problems from noise, which is what a CRM team would actually need to trust before acting on its output.
+<!-- **User testimonials:** None yet — this is a pre-launch portfolio project, not a deployed product with users. The honest equivalent at this stage is the monitoring output below: proof the system correctly distinguishes real problems from noise, which is what a CRM team would actually need to trust before acting on its output. -->
 
 **Monitoring output (2017-03-01 drift run, chained from `serve.py`):**
 - 7 of 20 features triggered PSI > 0.2 alerts: `n_txn`, `last_is_auto_renew`, `days_since_last_txn` (transaction features) and `log_days`, `total_secs_sum`, `avg_completion_ratio`, `days_since_last_log` (log features)
@@ -158,18 +162,22 @@ This cohort is far more churn-heavy (86.7%) than the training population (90.5% 
 
 **Challenge:** The KKBox dataset has a critical coverage gap. `user_logs.csv` only covers March 1-31, 2017. Users expiring in early March have `feature_cutoff = expiry - 14 days` falling before March 1 — meaning no log data is available for them. The label dataset (970K users in `train.csv`) contains ~930K users without a verified March expiry record in the transactions extract.
 
-**Decision:** Train only on the 35,518 users with a confirmed `anchor_expiry_date` in the transactions table. Users without a verified anchor (`has_anchor=0`) have feature_cutoff=2017-02-15 and no log features — training on them would produce a 97% null feature matrix and AUC-PR=0.39. The clean 35,518-user cohort yields AUC-PR=0.976 on the held-out test set (see The Results above).
+**Decision:** Train only on the 35,518 users with a confirmed `anchor_expiry_date` in the transactions table. Users without a verified anchor (`has_anchor=0`) have feature_cutoff=2017-02-15 and no log features — training on them would produce a 97% null feature matrix and AUC-PR=0.39. The clean 35,518-user cohort yields AUC-PR=0.979 on the held-out test set (see The Results above).
 
 **Feature cutoff enforcement:** `feature_cutoff_dt = expire_date - 14 days` is computed *inside* `build_features()`, not passed by the caller. This prevents the serving pipeline from accidentally passing today's date and silently including post-cutoff data (leakage).
 
 ### Model Approach
 
-LightGBM with `scale_pos_weight=10.1` to handle the 8.99% churn class imbalance. Primary metric: AUC-PR (not AUC-ROC) because the positive class is rare and AUC-ROC is optimistic under class imbalance.
+**XGBoost**, chosen over LightGBM and RandomForest. Scoring is a daily batch job (`serve.py`), not a low-latency API, so LightGBM's main edge — faster inference — buys nothing here; the real trade-off is XGBoost vs. RandomForest. XGBoost wins on native missing-value handling (a learned split direction per feature, no imputation required — see Feature Engineering below), L1/L2 regularization, and a higher tuning ceiling for a ranking-quality metric (AUC-PR) than a bagging ensemble typically reaches on tabular data with real signal.
+
+`scale_pos_weight` is computed dynamically at runtime from the actual training split (`_auto_scale_pos_weight()` in `model_trainer.py`, called fresh by `train.py` on every run) rather than hardcoded. This matters because the two populations in this project have inverted class balance: KKBox's raw, full dataset is ~8.99% churn (churn rare), but the 35,518-user **anchored training cohort** this model actually trains on is 90.5% churn — retained subscribers are the minority class here (~9.5%), not churners. Computing the weight at runtime means the model always corrects for whichever class is actually rare in the data it's given, instead of a stale constant baked in from a different population. Primary metric: AUC-PR (not AUC-ROC) — not because the positive class is rare (in this cohort it isn't), but because AUC-ROC degrades toward uninformative whenever either class dominates heavily, while AUC-PR stays tied to precision/recall at the ranked shortlist CRM actually acts on (see The Results above).
+
+**Categorical features and a train/serve skew XGBoost introduces that LightGBM didn't have:** 5 of the 20 features (`last_is_auto_renew`, `last_is_cancel`, `ever_cancelled`, `ever_promo`, `registered_via`) are categorical, not continuous. LightGBM accepts a plain list of column names (`categorical_feature=`) and splits on them natively with zero setup. XGBoost's `enable_categorical` needs the same pandas `category` dtype — and the same category *set* — at both train and inference time; a serving batch that doesn't happen to contain every `registered_via` code the training cohort saw would otherwise get silently re-derived, wrong categories. The fix reuses this project's own established pattern for `p99_secs`: the category lists are frozen once from the training cohort (`feature_module.freeze_cat_categories()`), persisted in the same `feature_config.json` MLflow artifact, and re-applied identically at serving time (`serve.py`) and validation time (`validate.py`) — never re-derived from whatever subset of values a given batch happens to contain. Feature *storage* (parquet, the PSI drift baseline) stays plain numeric throughout; the categorical cast is applied only on a copy, at the exact point features are handed to the model.
 
 20 features across three categories:
 - **Transaction features** (8): recency, frequency, plan type, payment patterns, cancellation history
 - **Log/behavioral features** (7): listening days, total seconds, song completion rate, days since last activity
-- **Member features** (5): registration channel, tenure, city
+- **Member features** (2): registration channel (`registered_via`), tenure (`tenure_days`)
 
 The `p99_secs` winsorization threshold (43,573.98 sec/day) is computed once from the training distribution by `build_dataset.py` and logged to MLflow as `feature_config.json`, part of the `dataset_build` run's artifacts (see Key Decision: Dataset Storage below). The serving and monitoring pipelines fetch this frozen value from whichever dataset trained the current production model — never a local file, never recomputed from the serving distribution, which would otherwise silently change the feature scale as listening patterns drift.
 
@@ -218,7 +226,7 @@ All three tracks log to the Prefect run output only — nothing is persisted. `m
 
 **Reasoning:** A feature store solves point-in-time correctness at scale, when dozens of models and pipelines share features and the risk of silent divergence is high. At 35K users/month with a single model and two pipeline files, a shared module enforces the same guarantee with a fraction of the operational overhead. The key design decision is that `feature_cutoff_dt = expire_date - 14 days` is computed *internally* by `build_features()` — the caller passes `expire_date` and never touches the cutoff. That one invariant prevents the most common leakage pattern.
 
-**Outcome:** Zero training-serving skew confirmed. AUC-PR on the held-out test set: 0.976. Verified by running the same `build_features()` call with identical inputs from both training and monitoring pipelines and comparing outputs.
+**Outcome:** Zero training-serving skew confirmed. AUC-PR on the held-out test set: 0.979. Verified by running the same `build_features()` call with identical inputs from both training and monitoring pipelines and comparing outputs.
 
 **What I'd do differently at scale:** Add a feature lineage test that runs in CI — serialize the feature vector from training and serving for the same user+date and assert they match byte-for-byte. Right now the invariant is enforced by code structure; at scale it should be enforced by a test.
 
@@ -367,9 +375,9 @@ MLFLOW_TRACKING_URI=http://localhost:5000 uv run python -c "
    import mlflow
    client = mlflow.tracking.MlflowClient()
    client.set_registered_model_alias(
-       name='LightGBMChurnClassifier', alias='production', version='1',
+       name='ChurnClassifier', alias='production', version='1',
    )
-   mv = client.get_model_version_by_alias('LightGBMChurnClassifier', 'production')
+   mv = client.get_model_version_by_alias('ChurnClassifier', 'production')
    print(f'production alias -> version {mv.version}, run_id={mv.run_id}')
    "
 
@@ -406,20 +414,20 @@ src/
 │   ├── feature_module.py   — build_features(), FEATURE_COLS, CAT_COLS
 │   ├── label_module.py     — build_cohort(), compute_labels()
 │   ├── drift_module.py     — compute_feature_drift(), evaluate_cohort_performance()
-│   ├── model_trainer.py    — train_lgbm(), split_cohort_3way(), compute_p99_secs()
+│   ├── model_trainer.py    — train_xgb(), split_cohort_3way(), compute_p99_secs()
 │   ├── model_loader.py     — make_model_loader() factory
 │   └── risk_tier.py        — make_tier_strategy() factory
 ├── pipelines/              — Prefect @flow + @task, CLI entry points
 │   ├── label.py            — monthly labeling pipeline
 │   ├── build_dataset.py    — labeled cohort → features → train/val/test split → MLflow
-│   ├── train.py            — fit LightGBM on an already-built dataset, register unpromoted
+│   ├── train.py            — fit XGBoost on an already-built dataset, register unpromoted
 │   ├── validate.py         — score candidate vs production on held-out test, alias challenger
 │   ├── retrain.py          — thin orchestrator: build_dataset → train → validate
 │   ├── serve.py            — daily scoring pipeline, chains drift monitoring
 │   └── monitor.py          — drift (Track 1) + performance (Track 2) monitoring
 ├── experiments/            — one-off baseline scripts (not the production path)
 │   ├── build_training_set.py — cohort selection + label join, writes train_features.parquet
-│   └── train_baseline.py     — train LightGBM baseline
+│   └── train_baseline.py     — train XGBoost baseline
 └── api/                    — FastAPI Score API
     ├── main.py
     ├── schemas.py

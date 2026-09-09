@@ -3,7 +3,7 @@ Daily batch scoring pipeline — Step 3.
 
 Fetches users whose subscription expires exactly 14 days from scoring_date,
 builds features via the shared feature module, scores with the production
-LightGBM model, and writes results to the PostgreSQL predictions table and
+XGBoost model, and writes results to the PostgreSQL predictions table and
 a Parquet file. On success, also chains a drift-monitoring check
 (pipelines/monitor.py's run_drift_monitoring) using the feature matrix
 already built here, so that check doesn't recompute features from scratch.
@@ -21,7 +21,7 @@ scoring_date : date, optional
     Date to score for. Defaults to today. Pass a historical date to backfill.
 use_mlflow : bool
     True (default) — load the "production"-aliased model from MLflow registry.
-    False          — load from models/lgbm_baseline.pkl (local dev / testing).
+    False          — load from models/xgb_baseline.pkl (local dev / testing).
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ from config import (
     load_risk_tiers_config,
     load_serving_config,
 )
-from core.feature_module import FEATURE_COLS, build_features
+from core.feature_module import CAT_COLS, FEATURE_COLS, build_features
 from core.model_loader import (
     ModelLoadError,
     ModelNotFoundError,
@@ -153,6 +153,12 @@ def build_feature_matrix(
     """
     Call build_features() with data_source="postgres" for the cohort.
     Validates output shape and column names before returning.
+
+    Returns plain numeric/raw dtypes (including CAT_COLS) — this feature_df
+    is reused as-is for drift monitoring (current_df, PSI needs numeric
+    input) and health-metric logging. The categorical cast for XGBoost is
+    applied separately, only on a copy, right before scoring — see
+    score_cohort()'s cat_categories parameter.
     """
     logger = get_run_logger()
     try:
@@ -199,8 +205,8 @@ def load_production_model(
     loader = make_model_loader(
         use_mlflow=use_mlflow,
         mlflow_config=config.mlflow if use_mlflow else None,
-        pkl_path=BASE_DIR / "models" / "lgbm_baseline.pkl" if not use_mlflow else None,
-        version_label="lgbm_baseline_local",
+        pkl_path=BASE_DIR / "models" / "xgb_baseline.pkl" if not use_mlflow else None,
+        version_label="xgb_baseline_local",
     )
     model = loader.load()
     version = loader.get_model_version()
@@ -212,54 +218,71 @@ def load_production_model(
     return model, version, dataset_version_id
 
 
-@task(name="resolve-p99-secs", retries=2, retry_delay_seconds=30, tags=["mlflow", "features"])
-def resolve_p99_secs(
+@task(name="resolve-feature-config", retries=2, retry_delay_seconds=30, tags=["mlflow", "features"])
+def resolve_feature_config(
     dataset_version_id: str | None,
     config: ServingConfig,
-) -> float:
+) -> tuple[float, dict[str, list]]:
     """
-    Fetch p99_secs from the dataset-build run that trained the currently
-    loaded production model, so serving always winsorizes with the same
-    threshold the model was trained on — never a stale local file.
+    Fetch p99_secs and the frozen CAT_COLS category lists from the
+    dataset-build run that trained the currently loaded production model, so
+    serving always winsorizes and categorically encodes with the exact
+    values the model was trained on — never a stale local file.
 
     Falls back to the local models/feature_config.json only when there is no
     dataset_version_id (the --no-mlflow local dev pickle path).
+
+    Returns (p99_secs, cat_categories).
     """
     logger = get_run_logger()
     if dataset_version_id is None:
-        p99_secs = load_feature_config(config.feature_config_path)["p99_secs"]
-        logger.info(f"resolve_p99_secs | no dataset_version_id (dev pickle) — using local file | p99_secs={p99_secs}")
-        return p99_secs
+        feature_config = load_feature_config(config.feature_config_path)
+        p99_secs = feature_config["p99_secs"]
+        cat_categories = feature_config["cat_categories"]
+        logger.info(f"resolve_feature_config | no dataset_version_id (dev pickle) — using local file | p99_secs={p99_secs}")
+        return p99_secs, cat_categories
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_dir = mlflow.artifacts.download_artifacts(
             run_id=dataset_version_id, artifact_path="dataset", dst_path=tmpdir,
         )
         with open(Path(local_dir) / "feature_config.json") as f:
-            p99_secs = json.load(f)["p99_secs"]
+            feature_config = json.load(f)
+            p99_secs = feature_config["p99_secs"]
+            cat_categories = feature_config["cat_categories"]
 
-    logger.info(f"resolve_p99_secs complete | dataset_version_id={dataset_version_id} | p99_secs={p99_secs}")
-    return p99_secs
+    logger.info(f"resolve_feature_config complete | dataset_version_id={dataset_version_id} | p99_secs={p99_secs}")
+    return p99_secs, cat_categories
 
 
 @task(name="score-cohort", retries=0, tags=["inference"])
 def score_cohort(
     feature_df: pd.DataFrame,
     model: ScoringModel,
+    cat_categories: dict[str, list],
 ) -> np.ndarray:
     """
     Run predict_proba on the feature matrix.
     Returns a 1-D array of churn probabilities (positive class).
+
+    Applies the frozen CAT_COLS categorical cast on a copy of feature_df
+    right before scoring — feature_df itself stays in plain numeric dtype
+    (it's also used for drift monitoring and health-metric logging, both of
+    which need numeric input), so the cast must never mutate the original.
     """
     logger = get_run_logger()
+    X = feature_df[FEATURE_COLS].copy()
+    for col in CAT_COLS:
+        X[col] = pd.Categorical(X[col], categories=cat_categories[col])
+
     try:
-        # LightGBM Booster (from lgb.train) uses .predict() — returns 1-D probabilities.
-        # Sklearn-style wrappers use .predict_proba() — returns 2-D (n, 2) array.
+        # Sklearn-style wrappers (e.g. XGBClassifier) use .predict_proba() —
+        # returns 2-D (n, 2) array. Raw boosters use .predict() — 1-D probabilities.
         if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(feature_df[FEATURE_COLS])
+            proba = model.predict_proba(X)
             scores = proba[:, 1] if proba.ndim == 2 else proba
         else:
-            scores = model.predict(feature_df[FEATURE_COLS])
+            scores = model.predict(X)
     except Exception as exc:
         raise ScoringError(f"model scoring failed: {exc}") from exc
 
@@ -495,9 +518,9 @@ def run_serving_pipeline(
 
     # ── Steps 2-6: Model, features, scores, tiers, writes ────────────────────
     model, model_version, dataset_version_id = load_production_model(config=config, use_mlflow=use_mlflow)
-    p99_secs = resolve_p99_secs(dataset_version_id=dataset_version_id, config=config)
+    p99_secs, cat_categories = resolve_feature_config(dataset_version_id=dataset_version_id, config=config)
     feature_df = build_feature_matrix(cohort_df=cohort_df, config=config, p99_secs=p99_secs)
-    scores = score_cohort(feature_df=feature_df, model=model)
+    scores = score_cohort(feature_df=feature_df, model=model, cat_categories=cat_categories)
     tiers = assign_risk_tiers(scores=scores, tier_config=tier_config)
     rows_written = write_predictions_postgres(
         cohort_df=cohort_df,

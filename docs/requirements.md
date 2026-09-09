@@ -78,7 +78,7 @@ Features must be computed consistently between training and inference. This is a
 
 **NF6 — Maintainability** A single ML engineer must be able to understand, modify, and debug the system. This means: no unnecessary tooling, clear module boundaries, documented configs, and no "magic" steps that only work on one person's machine.
 
-**NF7 — Cost** MVP runs on a single machine or small cloud instance. No distributed compute needed for this data scale. Pandas \+ Scikit-learn \+ LightGBM is sufficient. Kubernetes, Spark, and Flink are out of scope and would be overengineering.
+**NF7 — Cost** MVP runs on a single machine or small cloud instance. No distributed compute needed for this data scale. Pandas \+ Scikit-learn \+ XGBoost is sufficient. Kubernetes, Spark, and Flink are out of scope and would be overengineering.
 
 **NF8 — Observability** Every pipeline run must produce a structured log: what data was read, how many users were scored, what the score distribution looked like, and whether any anomalies were detected. This log is the foundation of your monitoring layer.
 

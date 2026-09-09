@@ -24,13 +24,14 @@ candidate_version   : MLflow registered model version to evaluate (the one
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import tempfile
 from pathlib import Path
 
 import mlflow
-import mlflow.lightgbm
+import mlflow.xgboost
 import pandas as pd
 from mlflow import MlflowClient
 from prefect import flow, get_run_logger, task
@@ -39,7 +40,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import ValidationConfig, load_validation_config
-from core.feature_module import FEATURE_COLS
+from core.feature_module import CAT_COLS, FEATURE_COLS
 from core.model_loader import ModelNotFoundError, make_model_loader
 from core.model_trainer import evaluate_on_holdout
 
@@ -87,6 +88,29 @@ def load_test_set(dataset_version_id: str, config: ValidationConfig) -> pd.DataF
     return test_df
 
 
+@task(name="load-cat-categories", retries=2, retry_delay_seconds=30, tags=["mlflow", "dataset"])
+def load_cat_categories(dataset_version_id: str, config: ValidationConfig) -> dict[str, list]:
+    """
+    Fetch the frozen CAT_COLS category lists from feature_config.json for this
+    dataset-build run — both the candidate and production model were trained
+    with this exact categorical encoding (enable_categorical=True), so scoring
+    either one on X_test here must apply the same cast or XGBoost will either
+    error or silently misencode CAT_COLS.
+    """
+    logger = get_run_logger()
+    mlflow.set_tracking_uri(config.mlflow.tracking_uri)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_dir = mlflow.artifacts.download_artifacts(
+            run_id=dataset_version_id, artifact_path="dataset", dst_path=tmpdir,
+        )
+        with open(Path(local_dir) / "feature_config.json") as f:
+            cat_categories = json.load(f)["cat_categories"]
+
+    logger.info(f"load_cat_categories complete | dataset_version_id={dataset_version_id}")
+    return cat_categories
+
+
 @task(name="load-candidate-model", retries=1, retry_delay_seconds=30, tags=["mlflow"])
 def load_candidate_model(candidate_version: str, config: ValidationConfig):
     """Load the specific candidate model version under evaluation."""
@@ -95,7 +119,7 @@ def load_candidate_model(candidate_version: str, config: ValidationConfig):
 
     model_uri = f"models:/{config.mlflow.model_name}/{candidate_version}"
     try:
-        model = mlflow.lightgbm.load_model(model_uri)
+        model = mlflow.xgboost.load_model(model_uri)
     except Exception as exc:
         raise CandidateLoadError(f"Failed to load candidate from {model_uri}: {exc}") from exc
 
@@ -127,11 +151,21 @@ def load_production_model_for_comparison(config: ValidationConfig):
         return None
 
 
+def _cast_categoricals(X: pd.DataFrame, cat_categories: dict[str, list]) -> pd.DataFrame:
+    """Apply the frozen CAT_COLS categorical cast on a copy, matching how the model was trained."""
+    X = X.copy()
+    for col in CAT_COLS:
+        X[col] = pd.Categorical(X[col], categories=cat_categories[col])
+    return X
+
+
 @task(name="evaluate-candidate", retries=0, tags=["evaluation"])
-def evaluate_candidate(candidate_model, test_df: pd.DataFrame, config: ValidationConfig) -> dict:
+def evaluate_candidate(
+    candidate_model, test_df: pd.DataFrame, cat_categories: dict[str, list], config: ValidationConfig
+) -> dict:
     """Score the candidate on the held-out test set."""
     logger = get_run_logger()
-    X_test = test_df[FEATURE_COLS]
+    X_test = _cast_categoricals(test_df[FEATURE_COLS], cat_categories)
     y_test = test_df["is_churn"]
     metrics = evaluate_on_holdout(candidate_model, X_test, y_test, top_k=config.top_k)
     logger.info(f"evaluate_candidate complete | test_auc_pr={metrics['val_auc_pr']:.4f}")
@@ -143,6 +177,7 @@ def compare_and_decide(
     candidate_metrics: dict,
     production,
     test_df: pd.DataFrame,
+    cat_categories: dict[str, list],
     config: ValidationConfig,
 ) -> tuple[bool, dict | None]:
     """
@@ -151,6 +186,13 @@ def compare_and_decide(
     Compares candidate_metrics against the production model's performance on
     the same test_df the candidate never trained or early-stopped on. If
     production is None (first run) -> always promote.
+
+    Note: production was trained on its own dataset-build run, which may have
+    frozen a different (if overlapping) category set than the candidate's.
+    Applying the candidate's cat_categories here is the closest available
+    approximation without re-fetching production's own dataset lineage; any
+    category XGBoost hasn't seen from production's training falls back to
+    XGBoost's missing-value handling rather than a hard error.
     """
     logger = get_run_logger()
 
@@ -158,7 +200,7 @@ def compare_and_decide(
         logger.info("compare_and_decide | no production model -> promoting candidate to challenger")
         return True, None
 
-    X_test = test_df[FEATURE_COLS]
+    X_test = _cast_categoricals(test_df[FEATURE_COLS], cat_categories)
     y_test = test_df["is_churn"]
 
     try:
@@ -266,13 +308,17 @@ def run_validation_pipeline(dataset_version_id: str, candidate_version: str) -> 
 
     # ── Step 1: Fetch test set + candidate model ──────────────────────────────
     test_df = load_test_set(dataset_version_id=dataset_version_id, config=config)
+    cat_categories = load_cat_categories(dataset_version_id=dataset_version_id, config=config)
     candidate_model = load_candidate_model(candidate_version=candidate_version, config=config)
-    candidate_metrics = evaluate_candidate(candidate_model=candidate_model, test_df=test_df, config=config)
+    candidate_metrics = evaluate_candidate(
+        candidate_model=candidate_model, test_df=test_df, cat_categories=cat_categories, config=config
+    )
 
     # ── Step 2: Compare against production ────────────────────────────────────
     production = load_production_model_for_comparison(config=config)
     should_promote, production_metrics = compare_and_decide(
-        candidate_metrics=candidate_metrics, production=production, test_df=test_df, config=config
+        candidate_metrics=candidate_metrics, production=production, test_df=test_df,
+        cat_categories=cat_categories, config=config,
     )
 
     # ── Step 3: Promote to challenger (never touches production) ─────────────

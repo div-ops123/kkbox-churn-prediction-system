@@ -1,3 +1,28 @@
 {
-  "p99_secs": 43805.51605000006
+  "p99_secs": 43805.51605000006,
+  "cat_categories": {
+    "last_is_auto_renew": [
+      0,
+      1
+    ],
+    "last_is_cancel": [
+      0,
+      1
+    ],
+    "ever_cancelled": [
+      0,
+      1
+    ],
+    "ever_promo": [
+      0,
+      1
+    ],
+    "registered_via": [
+      3,
+      4,
+      7,
+      9,
+      13
+    ]
+  }
 }

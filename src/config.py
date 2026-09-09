@@ -156,7 +156,7 @@ def load_serving_config() -> ServingConfig:
     pg = _require_postgres()
     mlflow_cfg = MLflowConfig(
         tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
-        model_name=os.getenv("MLFLOW_MODEL_NAME", "LightGBMChurnClassifier"),
+        model_name=os.getenv("MLFLOW_MODEL_NAME", "ChurnClassifier"),
         model_alias=os.getenv("MLFLOW_MODEL_ALIAS", "production"),
     )
     return ServingConfig(
@@ -295,7 +295,7 @@ def load_dataset_build_config(
     pg = _require_postgres()
     mlflow_cfg = MLflowConfig(
         tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
-        model_name=os.getenv("MLFLOW_MODEL_NAME", "LightGBMChurnClassifier"),
+        model_name=os.getenv("MLFLOW_MODEL_NAME", "ChurnClassifier"),
         model_alias=os.getenv("MLFLOW_MODEL_ALIAS", "production"),
     )
     return DatasetBuildConfig(
@@ -331,7 +331,7 @@ def load_training_config(
     pg = _require_postgres()
     mlflow_cfg = MLflowConfig(
         tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
-        model_name=os.getenv("MLFLOW_MODEL_NAME", "LightGBMChurnClassifier"),
+        model_name=os.getenv("MLFLOW_MODEL_NAME", "ChurnClassifier"),
         model_alias=os.getenv("MLFLOW_MODEL_ALIAS", "production"),
     )
     return TrainingConfig(
@@ -360,7 +360,7 @@ def load_validation_config() -> ValidationConfig:
     pg = _require_postgres()
     mlflow_cfg = MLflowConfig(
         tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
-        model_name=os.getenv("MLFLOW_MODEL_NAME", "LightGBMChurnClassifier"),
+        model_name=os.getenv("MLFLOW_MODEL_NAME", "ChurnClassifier"),
         model_alias=os.getenv("MLFLOW_MODEL_ALIAS", "production"),
     )
     top_k = int(os.getenv("VALIDATION_TOP_K", "100"))
@@ -422,7 +422,7 @@ def load_monitoring_config(
     pg = _require_postgres()
     mlflow_cfg = MLflowConfig(
         tracking_uri=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"),
-        model_name=os.getenv("MLFLOW_MODEL_NAME", "LightGBMChurnClassifier"),
+        model_name=os.getenv("MLFLOW_MODEL_NAME", "ChurnClassifier"),
         model_alias=os.getenv("MLFLOW_MODEL_ALIAS", "production"),
     )
     return MonitoringConfig(

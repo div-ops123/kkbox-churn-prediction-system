@@ -6,11 +6,11 @@ no file I/O. Each public function opens and closes its own DuckDB connection.
 
 Public API
 ----------
-    TrainArtifact            — dataclass: trained Booster + all metrics frozen at training time
+    TrainArtifact            — dataclass: trained model + all metrics frozen at training time
     compute_p99_secs(...)    → float
     split_cohort(...)        → (train_df, val_df)
     split_cohort_3way(...)   → (train_df, val_df, test_df)
-    train_lgbm(...)          → TrainArtifact
+    train_xgb(...)           → TrainArtifact
     evaluate_on_holdout(...) → dict
 """
 
@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import duckdb
-import lightgbm as lgb
 import pandas as pd
+import xgboost as xgb
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 
@@ -39,7 +39,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 class TrainArtifact:
     """All outputs of a single training run, bundled for hand-off to the Prefect task."""
 
-    booster: lgb.Booster
+    booster: xgb.XGBClassifier
     feature_cols: list[str]    # snapshot of FEATURE_COLS at training time
     cat_cols: list[str]        # snapshot of CAT_COLS at training time
     p99_secs: float            # frozen winsorization threshold — must match serving
@@ -194,17 +194,18 @@ def split_cohort_3way(
     return train_df.copy(), val_df.copy(), test_df.copy()
 
 
-def train_lgbm(
+def train_xgb(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     scale_pos_weight: float,
+    cat_categories: dict[str, list],
     n_estimators: int = 1000,
     early_stopping_rounds: int = 50,
     p99_secs: float = 0.0,
     seed: int = 42,
 ) -> TrainArtifact:
     """
-    Train a LightGBM binary classifier with AUC-PR as the eval metric.
+    Train an XGBoost binary classifier with AUC-PR as the eval metric.
 
     Does NOT write files or call MLflow — all I/O is the caller's responsibility.
 
@@ -212,38 +213,38 @@ def train_lgbm(
     ----------
     train_df / val_df : DataFrames with FEATURE_COLS + 'is_churn' column.
     scale_pos_weight  : imbalance ratio (retained / churned).
+    cat_categories    : frozen {column: [category, ...]} for CAT_COLS (see
+                        feature_module.freeze_cat_categories) — applied here so
+                        XGBoost's enable_categorical sees the same category set
+                        it will see again at serving time.
     p99_secs          : winsorization threshold, stored in the returned artifact.
     """
-    X_train = train_df[FEATURE_COLS]
+    X_train = train_df[FEATURE_COLS].copy()
     y_train = train_df["is_churn"]
-    X_val = val_df[FEATURE_COLS]
+    X_val = val_df[FEATURE_COLS].copy()
     y_val = val_df["is_churn"]
 
-    params = _lgbm_params(scale_pos_weight, seed)
+    for col in CAT_COLS:
+        X_train[col] = pd.Categorical(X_train[col], categories=cat_categories[col])
+        X_val[col] = pd.Categorical(X_val[col], categories=cat_categories[col])
 
-    ds_train = lgb.Dataset(
-        X_train, label=y_train, categorical_feature=CAT_COLS, free_raw_data=False
-    )
-    ds_val = lgb.Dataset(
-        X_val, label=y_val, categorical_feature=CAT_COLS,
-        reference=ds_train, free_raw_data=False,
-    )
+    params = _xgb_params(scale_pos_weight, seed)
 
-    booster = lgb.train(
-        params,
-        ds_train,
-        num_boost_round=n_estimators,
-        valid_sets=[ds_val],
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=False),
-            lgb.log_evaluation(period=100),
-        ],
+    model = xgb.XGBClassifier(
+        **params,
+        n_estimators=n_estimators,
+        early_stopping_rounds=early_stopping_rounds,
+    )
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=False,
     )
 
-    metrics = evaluate_on_holdout(booster, X_val, y_val, top_k=100)
+    metrics = evaluate_on_holdout(model, X_val, y_val, top_k=100)
 
     return TrainArtifact(
-        booster=booster,
+        booster=model,
         feature_cols=list(FEATURE_COLS),
         cat_cols=list(CAT_COLS),
         p99_secs=p99_secs,
@@ -267,12 +268,12 @@ def evaluate_on_holdout(
     """
     Score model on X, return AUC-PR, AUC-ROC, Precision@K, Recall@K.
 
-    Handles both lgb.Booster (.predict) and sklearn wrapper (.predict_proba)
-    — same dispatch logic as the serving pipeline.
+    Handles both sklearn-style wrappers (.predict_proba, e.g. XGBClassifier)
+    and raw boosters (.predict) — same dispatch logic as the serving pipeline.
 
     Parameters
     ----------
-    model  : lgb.Booster or sklearn-compatible model
+    model  : XGBClassifier or any sklearn-compatible model
     X      : feature DataFrame (must contain FEATURE_COLS)
     y      : true binary labels
     top_k  : number of highest-scored users to evaluate for Precision/Recall@K
@@ -300,20 +301,37 @@ def evaluate_on_holdout(
 
 # ── Private helpers ────────────────────────────────────────────────────────────
 
-def _lgbm_params(scale_pos_weight: float, seed: int) -> dict:
-    """Fixed LightGBM training params — mirrors the baseline in experiments/train_baseline.py."""
+def _xgb_params(scale_pos_weight: float, seed: int) -> dict:
+    """
+    Fixed XGBoost training params — mirrors the baseline in experiments/train_baseline.py.
+
+    Remapped from the project's original LightGBM params, not literally
+    renamed — several have no 1:1 equivalent:
+      - num_leaves (leaf-wise growth)   -> tree_method="hist" + grow_policy="lossguide"
+                                            + max_leaves (closest analogue)
+      - min_child_samples (row count)   -> min_child_weight (hessian-sum threshold,
+                                            different semantics — left at XGBoost's
+                                            default and retuned against real
+                                            validation AUC-PR, not translated 1:1)
+      - feature_fraction                -> colsample_bytree
+      - bagging_fraction / bagging_freq -> subsample (no per-N-round frequency
+                                            knob in XGBoost)
+    enable_categorical=True + tree_method="hist" is required for CAT_COLS to be
+    split on natively (see train_xgb's cat_categories cast).
+    """
     return {
-        "objective":         "binary",
-        "metric":            "average_precision",
-        "scale_pos_weight":  scale_pos_weight,
-        "learning_rate":     0.05,
-        "num_leaves":        63,
-        "min_child_samples": 20,
-        "feature_fraction":  0.8,
-        "bagging_fraction":  0.8,
-        "bagging_freq":      5,
-        "verbosity":         -1,
-        "random_state":      seed,
+        "objective":          "binary:logistic",
+        "eval_metric":        "aucpr",
+        "scale_pos_weight":   scale_pos_weight,
+        "learning_rate":      0.05,
+        "tree_method":        "hist",
+        "grow_policy":        "lossguide",
+        "max_leaves":         63,
+        "colsample_bytree":   0.8,
+        "subsample":          0.8,
+        "enable_categorical": True,
+        "verbosity":          0,
+        "random_state":       seed,
     }
 
 

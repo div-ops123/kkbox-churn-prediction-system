@@ -10,6 +10,7 @@ pass the subscription expiry date, never the cutoff date itself.
 Public API
 ----------
     build_features(msno_list, expire_dates, p99_secs, data_source, ...)
+    freeze_cat_categories(df, cat_cols)  — compute frozen category lists for CAT_COLS
     FEATURE_COLS   — ordered list of feature column names
     CAT_COLS       — categorical subset of FEATURE_COLS
 """
@@ -57,6 +58,13 @@ def build_features(
     """
     Build feature vectors for a cohort of users.
 
+    Returns plain numeric/raw dtypes for every column, including CAT_COLS —
+    this DataFrame is used for storage (parquet), PSI drift comparison
+    (np.histogram requires numeric input), and health-metric logging, not
+    just model input. Callers that feed a model (model_trainer.train_xgb,
+    serve.py's score_cohort) apply the categorical cast themselves, on a
+    copy, right before calling the model — see freeze_cat_categories().
+
     Parameters
     ----------
     msno_list    : user IDs
@@ -75,7 +83,7 @@ def build_features(
     -------
     pd.DataFrame indexed by msno, columns = FEATURE_COLS, one row per input user.
     Users with no data in a source table get NaN for those columns — do NOT impute
-    (LightGBM handles NaN natively; absence != zero for this dataset).
+    (XGBoost handles NaN natively; absence != zero for this dataset).
     """
     if len(msno_list) != len(expire_dates):
         raise ValueError("msno_list and expire_dates must have the same length")
@@ -127,6 +135,25 @@ def build_features(
         con.close()
 
     return result.set_index("msno")[FEATURE_COLS]
+
+
+def freeze_cat_categories(
+    df: pd.DataFrame,
+    cat_cols: Sequence[str] = CAT_COLS,
+) -> dict[str, list]:
+    """
+    Compute the frozen {column: [category, ...]} mapping for CAT_COLS from a
+    training cohort's built features.
+
+    Call once on the training cohort (alongside compute_p99_secs), persist the
+    result to models/feature_config.json. Callers that feed a model (never
+    callers that store/compare raw features) apply it as
+    `pd.Categorical(df[col], categories=cat_categories[col])` on a copy right
+    before calling the model — this guarantees identical categorical encoding
+    regardless of which subset of values a given batch (e.g. a single serving
+    day) happens to contain.
+    """
+    return {col: sorted(df[col].dropna().unique().tolist()) for col in cat_cols}
 
 
 # ── private helpers ─────────────────────────────────────────────────────────

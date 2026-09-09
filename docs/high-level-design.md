@@ -34,7 +34,7 @@ Output: `dataset_version_id` (the MLflow run_id) — the handle the training and
 Trigger: called by the retrain orchestrator with a `dataset_version_id`, or run standalone.
 
 1. Fetch train + val from that dataset (no raw data, no feature computation — that's the dataset-build pipeline's job).
-2. Fit LightGBM, early-stopping on val.
+2. Fit XGBoost, early-stopping on val.
 3. Register a new model version, tagged with the `dataset_version_id` it was trained on.
 4. Never sets an alias. The model exists, versioned and inspectable, but unpromoted.
 
@@ -218,15 +218,15 @@ RAW TABLES
 
 **Why:** MLflow gives you the things you need in one tool: experiment tracking (log metrics per training run), artifact storage (save model files — and, now, dataset snapshots: each dataset-build run logs its train/val/test/baseline parquet and `feature_config.json` as artifacts, so training and validation always agree on exactly which snapshot they're using), model versioning (every trained model gets a version, tagged with the `dataset_version_id` it was trained on), and alias-based promotion (`production` for what's live, `challenger` for a validated candidate not yet live — promoting challenger to production is a separate, not-yet-built deployment step). It runs as a lightweight server on your VM with artifact storage pointing to local disk or S3.
 
-**Specific justification over alternatives:** Weights & Biases requires cloud dependency. SageMaker is AWS lock-in. MLflow is open source, self-hostable, and integrates with scikit-learn and LightGBM in three lines of code.
+**Specific justification over alternatives:** Weights & Biases requires cloud dependency. SageMaker is AWS lock-in. MLflow is open source, self-hostable, and integrates with scikit-learn and XGBoost in three lines of code.
 
 ---
 
-### **Model — LightGBM**
+### **Model — XGBoost**
 
-**What:** LightGBM gradient boosting classifier.
+**What:** XGBoost gradient boosting classifier.
 
-**Why:** Handles tabular data with mixed feature types (numeric behavioral features, categorical demographic features) without extensive preprocessing. Trains fast on datasets with hundreds of thousands of rows. Natively handles missing values. Produces well-calibrated probability scores, which your risk tier thresholds depend on. Outperforms random forest and logistic regression on this class of problem consistently.
+**Why:** Scoring here is a daily batch job (`serve.py`), not a low-latency API — LightGBM's main edge over other boosted-tree libraries, faster inference, isn't a relevant differentiator at this scale, so the real choice was XGBoost vs. RandomForest. XGBoost natively handles missing values (a learned split direction per feature, no imputation needed) and mixed feature types (numeric behavioral features, categorical demographic features via `enable_categorical`) without extensive preprocessing, offers L1/L2 regularization RandomForest doesn't, and produces well-calibrated probability scores, which your risk tier thresholds depend on. Its higher tuning ceiling on ranking-quality metrics (AUC-PR) is worth the extra hyperparameter surface at this problem's scale.
 
 ---
 
@@ -324,7 +324,7 @@ containers:
 | EDA / experimentation | JupyterLab \+ DuckDB | Queries large files without RAM explosion |
 | Pipeline orchestration | Prefect | Python-native, low ops overhead vs Airflow |
 | Experiment tracking | MLflow | Open source, self-hosted, versioning \+ registry \+ dataset lineage |
-| Model | LightGBM | Best prior for tabular churn, fast, handles nulls |
+| Model | XGBoost | Best prior for tabular churn, handles nulls natively, no inference-speed pressure (batch scoring) |
 | Prediction \+ label store | PostgreSQL tables | Same instance, low volume, simple queries |
 | Monitoring output | Logged via Prefect run output | No persisted store — nothing ever read one back |
 | Drift \+ perf monitoring | Custom PSI (`core/drift_module.py`) | Full control over bin-edge anchoring; ~40 lines, no external dependency |

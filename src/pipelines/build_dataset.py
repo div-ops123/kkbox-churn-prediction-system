@@ -43,7 +43,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import DatasetBuildConfig, load_dataset_build_config
-from core.feature_module import FEATURE_COLS, build_features
+from core.feature_module import FEATURE_COLS, build_features, freeze_cat_categories
 from core.model_trainer import compute_p99_secs, split_cohort_3way
 
 
@@ -122,14 +122,16 @@ def load_label_cohort(config: DatasetBuildConfig) -> pd.DataFrame:
 @task(name="build-cohort-features", retries=0, tags=["features"])
 def build_cohort_features(
     cohort_df: pd.DataFrame, config: DatasetBuildConfig
-) -> tuple[pd.DataFrame, float]:
+) -> tuple[pd.DataFrame, float, dict[str, list]]:
     """
     Compute p99_secs from this cohort, then call build_features() from the
-    shared feature_module.
+    shared feature_module. Freezes the CAT_COLS category lists from this
+    cohort's built features so serve.py/monitor.py can apply identical
+    categorical encoding later (see feature_module.freeze_cat_categories).
 
-    Returns (result, p99_secs) where result is indexed by msno with
-    FEATURE_COLS + [is_churn, cohort_month]. cohort_month is used by
-    split_cohort_3way() for the rolling time-based split.
+    Returns (result, p99_secs, cat_categories) where result is indexed by
+    msno with FEATURE_COLS + [is_churn, cohort_month]. cohort_month is used
+    by split_cohort_3way() for the rolling time-based split.
     """
     logger = get_run_logger()
 
@@ -159,6 +161,16 @@ def build_cohort_features(
     except Exception as exc:
         raise FeatureBuildError(f"build_features() failed: {exc}") from exc
 
+    # Freeze the category lists only — do NOT cast features_df's dtype here.
+    # features_df becomes train/val/test/baseline_features.parquet, and
+    # baseline_features.parquet feeds monitor.py's PSI drift computation
+    # (np.histogram), which needs plain numeric dtype. The categorical cast
+    # is applied later, only at the point features are actually fed into
+    # XGBoost (model_trainer.train_xgb / serve.py's score_cohort) — never to
+    # data that's stored, compared for drift, or logged.
+    cat_categories = freeze_cat_categories(features_df)
+    logger.info(f"build_cohort_features | cat_categories={cat_categories}")
+
     cohort_meta = cohort_df.set_index("msno")[["is_churn"]].copy()
     cohort_meta["cohort_month"] = (
         pd.to_datetime(cohort_df.set_index("msno")["anchor_expiry_date"])
@@ -171,13 +183,14 @@ def build_cohort_features(
         f"build_cohort_features complete"
         f" | rows={len(result)} | avg_null_pct={null_feature_pct:.1f}%"
     )
-    return result, p99
+    return result, p99, cat_categories
 
 
 @task(name="split-and-persist-dataset", retries=0, tags=["mlflow", "dataset"])
 def split_and_persist_dataset(
     features_df: pd.DataFrame,
     p99_secs: float,
+    cat_categories: dict[str, list],
     config: DatasetBuildConfig,
 ) -> dict:
     """
@@ -227,7 +240,10 @@ def split_and_persist_dataset(
                 test_df.to_parquet(tmp / "test.parquet", index=True)
                 baseline_df.to_parquet(tmp / "baseline_features.parquet", index=True)
                 with open(tmp / "feature_config.json", "w") as f:
-                    json.dump({"p99_secs": round(p99_secs, 6)}, f, indent=2)
+                    json.dump(
+                        {"p99_secs": round(p99_secs, 6), "cat_categories": cat_categories},
+                        f, indent=2,
+                    )
 
                 mlflow.log_artifacts(str(tmp), artifact_path="dataset")
 
@@ -314,11 +330,12 @@ def run_dataset_build_pipeline(
         }
 
     # ── Step 2: Features ──────────────────────────────────────────────────────
-    features_df, p99_secs = build_cohort_features(cohort_df=cohort_df, config=config)
+    features_df, p99_secs, cat_categories = build_cohort_features(cohort_df=cohort_df, config=config)
 
     # ── Step 3: Split + persist to MLflow ─────────────────────────────────────
     dataset_result = split_and_persist_dataset(
-        features_df=features_df, p99_secs=p99_secs, config=config
+        features_df=features_df, p99_secs=p99_secs,
+        cat_categories=cat_categories, config=config,
     )
 
     # ── Step 4: Health metrics (logged only) ──────────────────────────────────
