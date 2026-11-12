@@ -4,12 +4,12 @@ A production-grade churn prediction system built on the [KKBox Music Streaming d
 
 ---
 
-## Demo
+<!-- ## Demo -->
 
 <!-- Video walkthrough — replace this comment block with the uploaded video/GIF -->
 <!-- [![Demo video](docs/demo-thumbnail.png)](docs/demo.mp4) -->
 
-*(Video walkthrough coming soon.)*
+<!-- *(Video walkthrough coming soon.)* -->
 
 ---
 
@@ -30,60 +30,7 @@ The dataset: 970K users, 8.99% churn rate, 18M+ user log events, transactions th
 An end-to-end ML platform with seven decoupled pipelines that mirror real industry architecture — each independently invocable, chained together only for the common-case flow:
 
 <!-- Architecture diagram: replace this comment block with your architecture image when ready -->
-<!-- ![Architecture Diagram](docs/architecture.png) -->
-
-```
-DATA SOURCES (PostgreSQL)
-transactions │ user_logs │ members
-        │
-        ▼
-FEATURE ENGINEERING MODULE
-core/feature_module.py — single shared library. Called separately by
-the dataset-build pipeline, the serving pipeline, and (on the standalone
-CLI backfill path only) the monitoring pipeline's drift track.
-Input: msno + expiry_date. Output: 20-feature vector per user.
-        │
-        ├─────────────────────────────────┬───────────────────────────┐
-        ▼                                 ▼                           │
-RETRAIN PATH (monthly, or perf-triggered)  SERVING PATH (daily)        │
-pipelines/retrain.py orchestrates:         pipelines/serve.py          │
-                                            1. Users expiring in       │
-1. build_dataset.py — pull labels,            exactly 14 days         │
-   build features, rolling train/val/test   2. Build features         │
-   split, log artifacts to MLflow           3. Load production model  │
-2. train.py — fit XGBoost on train/val,     4. Score cohort           │
-   register a new, unpromoted version       5. Apply risk tiers       │
-3. validate.py — score candidate vs         6. Write predictions      │
-   production on held-out test, alias          (Postgres + Parquet)   │
-   'challenger' if the candidate wins       7. Chain drift check ─────┤
-        │                                      (Track 1, in-memory    │
-        ▼                                      feature matrix,       │
-MODEL REGISTRY (MLflow)                        non-fatal)             │
-versions + metrics +                                │                 │
-production / challenger aliases                     ▼                 │
-                                            PREDICTION STORE (PG)      │
-                                                     │                 │
-                                                     ▼                 │
-                                            SCORE API — FastAPI        │
-                                            GET /health                │
-                                            GET /score/{user_id}       │
-                                            GET /cohort?date=...       │
-                                                                       │
-LABELING PIPELINE (monthly)                                           │
-pipelines/label.py — derive is_churn labels                           │
-from transaction renewals within 30 days                              │
-                                                                       │
-MONITORING PIPELINE ───────────────────────────────────────────────────┘
-pipelines/monitor.py
-Track 1 — Data drift: chained onto serve.py's run above in the common
-          case; standalone `monitor.py drift --date` rebuilds features
-          for backfill or recovery after a failed serving run
-Track 2 — Model performance (monthly): joins predictions + labels,
-          triggers pipelines/retrain.py when AUC-PR < threshold
-Track 3 — Pipeline health: computed inline by every pipeline above
-All three tracks: computed and logged via Prefect run output — no
-persistence layer, no dashboard (see Monitoring Strategy below).
-```
+![Architecture Diagram](docs/architecture.png)
 
 ### Tech Stack
 
@@ -329,7 +276,7 @@ All three tracks log to the Prefect run output only — nothing is persisted. `m
 
 ## Try It
 
-No live deployment yet — see the Demo section at the top for a video walkthrough. To run it yourself:
+To run it yourself:
 
 ### Local Setup
 
