@@ -1,276 +1,161 @@
-# KKBox Churn Prediction — Production ML System
+# PyTorch ANN Experiment — Customer Churn Prediction
 
-A production-grade churn prediction system built on the [KKBox Music Streaming dataset](https://www.kaggle.com/c/kkbox-churn-prediction-challenge). Predicts which subscribers will churn 14 days before their subscription expires, so marketing and CRM teams can intervene.
+### 1. Experiment Context
 
----
+This experiment extends the existing KKBOX customer churn prediction project.
 
-<!-- ## Demo -->
+The original project already includes:
+- Data preparation and feature engineering.
+- A traditional ML implementation using XGBoost.
+- An established evaluation methodology and business-oriented metrics.
 
-<!-- Video walkthrough — replace this comment block with the uploaded video/GIF -->
-<!-- [![Demo video](docs/demo-thumbnail.png)](docs/demo.mp4) -->
+The objective of this experiment is to implement an Artificial Neural Network (ANN) using PyTorch and compare its performance against the existing XGBoost model.
 
-<!-- *(Video walkthrough coming soon.)* -->
+**Scope:** Model development and experimentation, not another end-to-end ML project.
 
----
+The focus is on developing practical competence in the PyTorch model-development lifecycle.
 
-## The Problem
+### 2. Problem Definition
 
-KKBox loses revenue when subscribers cancel and the business finds out too late to act. Churn prediction needs to be:
+**What are we predicting?**
 
-- **Early enough** — scored 14 days before expiry, so retention campaigns can reach users while they're still active
-- **Reliable** — a model that silently degrades after retraining destroys trust faster than no model at all
-- **Operationalized** — predictions sitting in a notebook don't help CRM; they need to land in a queryable store with an API on top
+Predict which subscribers will churn 14 days before their subscription expires.
 
-The dataset: 970K users, 8.99% churn rate, 18M+ user log events, transactions through March 2017.
+This is a binary classification problem.
 
----
+**What should the model output?**
 
-## The Solution
+The model should output a churn probability score for each subscriber, rather than a hard classification label.
 
-An end-to-end ML platform with seven decoupled pipelines that mirror real industry architecture — each independently invocable, chained together only for the common-case flow:
+This allows the business to rank subscribers according to their estimated churn risk.
 
-<!-- Architecture diagram: replace this comment block with your architecture image when ready -->
-![Architecture Diagram](docs/architecture.png)
+### 3. Existing Benchmark
 
-### Tech Stack
+The existing XGBoost model serves as the traditional ML benchmark.
 
-| Component | Choice | Why |
-|---|---|---|
-| Source DB | PostgreSQL 16 on Docker | Handles 20M+ rows; indexed date-range queries |
-| Feature engineering | DuckDB (inside Python) | Queries CSVs + Postgres without loading into RAM |
-| Pipeline orchestration | Prefect | Python-native `@flow`/`@task`, simpler for solo local iteration than standing up Airflow's scheduler/webserver/metadata DB — trade-off below |
-| Experiment tracking | MLflow | Self-hosted, open source; covers tracking + registry + promotion in one tool |
-| Model | XGBoost | Native null handling, no inference-speed pressure since scoring is a daily batch job, higher tuning ceiling than RandomForest for this ranking task |
-| Prediction store | PostgreSQL table | Same instance as source; low write volume, simple queries |
-| Drift monitoring | Custom PSI (no Evidently) | Full control over bin-edge anchoring and alert logic |
-| Score API | FastAPI + Uvicorn | Async, auto OpenAPI docs, sub-200ms reads from indexed table |
-| Containerization | Docker Compose (infra only) | Single-command Postgres + MLflow; pipelines/API still run as bare Python processes — see Learnings below |
+Its configuration includes:
 
-### Key Features
+- Objective: `binary:logistic`
+- Evaluation metric: `aucpr`
 
-- **Leakage-safe feature engineering** — `feature_cutoff_dt = expire_date - 14 days` is enforced *inside* `build_features()`, not left to the caller, so training and serving can't accidentally see post-cutoff data.
-- **Zero train/serve skew** — training, serving, and drift monitoring all call the same `core/feature_module.py` function; there is no second implementation to drift out of sync.
-- **Automatic retraining trigger** — `monitor.py`'s performance track calls `retrain.py` as a direct sub-flow when monthly AUC-PR drops below threshold, no manual intervention required.
-- **Drift-aware, not just accuracy-aware monitoring** — PSI per feature against a training-time baseline, anchored bin edges, distinguishes real model degradation from expected structural drift (see the March 2017 log-coverage example below).
+The model produces raw probabilities using:
 
----
+```python
+proba = model.predict_proba(X)
+scores = proba[:, 1] if proba.ndim == 2 else proba
+```
 
-## The Results
+The ANN should produce equivalent probability scores to enable a meaningful comparison.
 
-**Technical metrics — held-out test set** (`retrain.py` validation step, n=5,328, mixed expiry dates across the training cohort):
+### 4. Business Context and Motivation
 
-| Metric | Value |
+The existing experiment evaluated 1,055 subscribers whose subscriptions were expiring on 2017-03-15.
+
+Of these subscribers, 915 were identified as genuine churn cases.
+
+The existing XGBoost model achieved:
+
+- AUC-PR: 0.859
+- Precision@100: 0.86
+
+The current ML solution already provides a strong result.
+
+A neural network is not being introduced because there is an established business need for one.
+
+In this particular problem:
+- The existing ML model performs well.
+- XGBoost is relatively interpretable compared with a neural network.
+- ANN training introduces additional computational and operational complexity.
+
+The ANN experiment is therefore primarily educational.
+
+The objective is to understand when neural networks are useful, how to implement them with PyTorch, and how their performance compares with traditional ML.
+
+### 5. Baselines and Model Comparison
+
+The experiment will use the following comparison:
+
+| Approach | Purpose |
 |---|---|
-| AUC-PR | **0.979** |
-| AUC-ROC | 0.833 |
-| Precision@K (K=100) | 1.0 |
-| Recall@K (K=100) | 0.021 |
-| Features engineered | 20 (transaction, log, member) |
-| Feature training-serving skew | **Zero** — single shared module |
+| Heuristic / rule-based | Simple business-rule baseline, where feasible |
+| XGBoost | Existing traditional ML benchmark |
+| PyTorch ANN | Neural network experiment |
 
-**What this proves:** this table exists to show the ranking mechanism works, not to claim a business outcome. n=5,328 spans mixed expiry dates across the training cohort — it's not a real single-day CRM batch, so "Precision@100 = 1.0" doesn't map to "we contacted 100 real people and got 100% right." What it does show: given a ranked list, the model can put 100 true churners at the very top with zero false positives (Precision@100=1.0) before recall inevitably stays low (Recall@100=0.021) simply because 100 is a small slice of a 5,328-user test set. K=100 here is illustrative, not a calibrated capacity figure — see the production table below for the number that actually corresponds to a real day's outreach batch.
+The existing XGBoost model is the primary benchmark.
 
-**Technical metrics — production cohort** (`monitor.py performance`, actual scored predictions joined against actual labels, cohort_month=2017-03, n=1,055, all expiring 2017-03-15):
+A heuristic baseline is not yet established. The KKBOX transaction and listening-log data have limitations, including missing listening-log coverage for many subscribers.
 
-| Metric | Value |
-|---|---|
-| AUC-PR | 0.859 |
-| AUC-ROC | 0.467 |
-| Precision@K (K=100) | 0.86 |
-| Recall@K (K=100) | 0.094 |
-| Churn rate in this cohort | 86.7% (915 of 1,055) |
+A business-informed heuristic could be explored separately if the available data supports a defensible rule.
 
-This cohort is even more churn-heavy (86.7%) than the already-imbalanced training population (90.5% among the 35,518 confirmed-anchor users, vs. 8.99% in KKBox's raw, unfiltered dataset) because it's a single day's worth of expiring users, not a representative sample. At that base rate, a classifier outputting random scores would already land near 0.87 AUC-PR, and AUC-ROC on a cohort this lopsided is close to uninformative — 0.467 here reflects the cohort's composition, not the model's ranking ability. The held-out test set above (mixed expiry dates) is the more meaningful accuracy signal.
+### 6. Evaluation Strategy
 
-**What this means for the business:** this table is what CRM would actually see on a real day, and it's the one worth translating into plain terms. Of the 1,055 subscribers expiring 2017-03-15, 915 are genuinely at risk of churning. The model's top-100 ranked list (K=100 is illustrative here, not a confirmed CRM daily capacity — see note above) catches 86 of them (Recall@100=0.094, ≈9.4% of that day's at-risk subscribers reached) and 86 of those 100 contacts are correct (Precision@100=0.86) — so a retention team acting on this list mostly isn't spending outreach budget on subscribers who weren't going to leave anyway. This table also exists for a second reason: it's what `monitor.py performance` computes automatically every month in production — it's Track 2's ongoing health check, not a one-off accuracy claim. If AUC-PR on a real monthly cohort like this one ever drops below a configured threshold, the system auto-triggers a full retrain-and-validate pipeline (see Monitoring Strategy below) — this table is a snapshot of that watchdog doing its job, not a second measurement of "is the model good."
+**Primary metric: AUC-PR (Average Precision)**
 
-**Business-relevant metrics:**
+AUC-PR is preferred over AUC-ROC because churn prediction involves class imbalance, and precision-recall performance is more informative about identifying positive cases.
 
-| Metric | Value |
-|---|---|
-| Training cohort size | 35,518 verified-anchor users |
-| Serving cohort size (single date, actionable by CRM) | 1,055 users |
-| Pipelines with retry/alerting | All 6 (build_dataset, label, train, validate, serve, monitor) — retrain.py orchestrates them and inherits their retries |
-| API endpoints | 3 (`/health`, `/score/{user_id}`, `/cohort`) |
+**Secondary business metric: Precision@100**
 
-<!-- **User testimonials:** None yet — this is a pre-launch portfolio project, not a deployed product with users. The honest equivalent at this stage is the monitoring output below: proof the system correctly distinguishes real problems from noise, which is what a CRM team would actually need to trust before acting on its output. -->
+Precision@100 measures the proportion of actual churners among the 100 highest-risk subscribers.
 
-**Monitoring output (2017-03-01 drift run, chained from `serve.py`):**
-- 7 of 20 features triggered PSI > 0.2 alerts: `n_txn`, `last_is_auto_renew`, `days_since_last_txn` (transaction features) and `log_days`, `total_secs_sum`, `avg_completion_ratio`, `days_since_last_log` (log features)
-- Log features: the known structural gap — this cohort's feature_cutoff (March 1) sits right at the edge of `user_logs.csv`'s March 1-31 coverage, so near-zero log history is expected, not model degradation
-- Transaction features: likely a cohort-composition effect — 1,055 users all expiring on the same single day vs. a training baseline spanning many expiry dates across the month, so anything tied to billing-cycle timing (transaction recency, auto-renew status right before expiry) can differ from the training-set average without any real drift happening
-- System correctly flagged alerts and continued without a false retraining trigger
+This reflects a practical business scenario where retention resources are limited and the business can only target a fixed number of subscribers.
 
----
+The ANN will be evaluated using the same evaluation population and metric definitions as XGBoost.
 
-## Technical Deep Dive
+### 7. Optimization Objective
 
-### Data Pipeline
+The ANN will be trained as a binary classification model.
 
-**Challenge:** The KKBox dataset has a critical coverage gap. `user_logs.csv` only covers March 1-31, 2017. Users expiring in early March have `feature_cutoff = expiry - 14 days` falling before March 1 — meaning no log data is available for them. The label dataset (970K users in `train.csv`) contains ~930K users without a verified March expiry record in the transactions extract.
+The initial training objective will be binary cross-entropy
 
-**Decision:** Train only on the 35,518 users with a confirmed `anchor_expiry_date` in the transactions table. Users without a verified anchor (`has_anchor=0`) have feature_cutoff=2017-02-15 and no log features — training on them would produce a 97% null feature matrix and AUC-PR=0.39. The clean 35,518-user cohort yields AUC-PR=0.979 on the held-out test set (see The Results above).
+The training objective and evaluation metric serve different purposes:
 
-**Feature cutoff enforcement:** `feature_cutoff_dt = expire_date - 14 days` is computed *inside* `build_features()`, not passed by the caller. This prevents the serving pipeline from accidentally passing today's date and silently including post-cutoff data (leakage).
+- Binary cross-entropy: Training loss optimized by gradient descent.
+- AUC-PR: Primary evaluation metric.
+- Precision@100: Business-oriented evaluation metric.
 
-### Model Approach
+The initial ANN will use PyTorch's `BCEWithLogitsLoss`, with raw logits supplied directly to the loss function.
 
-**XGBoost**, chosen over LightGBM and RandomForest. Scoring is a daily batch job (`serve.py`), not a low-latency API, so LightGBM's main edge — faster inference — buys nothing here; the real trade-off is XGBoost vs. RandomForest. XGBoost wins on native missing-value handling (a learned split direction per feature, no imputation required — see Feature Engineering below), L1/L2 regularization, and a higher tuning ceiling for a ranking-quality metric (AUC-PR) than a bagging ensemble typically reaches on tabular data with real signal.
+### 8. Experimental Fairness
 
-`scale_pos_weight` is computed dynamically at runtime from the actual training split (`_auto_scale_pos_weight()` in `model_trainer.py`, called fresh by `train.py` on every run) rather than hardcoded. This matters because the two populations in this project have inverted class balance: KKBox's raw, full dataset is ~8.99% churn (churn rare), but the 35,518-user **anchored training cohort** this model actually trains on is 90.5% churn — retained subscribers are the minority class here (~9.5%), not churners. Computing the weight at runtime means the model always corrects for whichever class is actually rare in the data it's given, instead of a stale constant baked in from a different population. Primary metric: AUC-PR (not AUC-ROC) — not because the positive class is rare (in this cohort it isn't), but because AUC-ROC degrades toward uninformative whenever either class dominates heavily, while AUC-PR stays tied to precision/recall at the ranked shortlist CRM actually acts on (see The Results above).
+To make the comparison meaningful, the experiment will preserve:
 
-**Categorical features and a train/serve skew XGBoost introduces that LightGBM didn't have:** 5 of the 20 features (`last_is_auto_renew`, `last_is_cancel`, `ever_cancelled`, `ever_promo`, `registered_via`) are categorical, not continuous. LightGBM accepts a plain list of column names (`categorical_feature=`) and splits on them natively with zero setup. XGBoost's `enable_categorical` needs the same pandas `category` dtype — and the same category *set* — at both train and inference time; a serving batch that doesn't happen to contain every `registered_via` code the training cohort saw would otherwise get silently re-derived, wrong categories. The fix reuses this project's own established pattern for `p99_secs`: the category lists are frozen once from the training cohort (`feature_module.freeze_cat_categories()`), persisted in the same `feature_config.json` MLflow artifact, and re-applied identically at serving time (`serve.py`) and validation time (`validate.py`) — never re-derived from whatever subset of values a given batch happens to contain. Feature *storage* (parquet, the PSI drift baseline) stays plain numeric throughout; the categorical cast is applied only on a copy, at the exact point features are handed to the model.
+- Existing prediction target and label definition.
+- Existing data preparation and feature engineering, subject to ANN input compatibility.
+- Existing train/validation/test split.
+- Existing evaluation population.
+- Existing metric definitions.
 
-20 features across three categories:
-- **Transaction features** (8): recency, frequency, plan type, payment patterns, cancellation history
-- **Log/behavioral features** (7): listening days, total seconds, song completion rate, days since last activity
-- **Member features** (2): registration channel (`registered_via`), tenure (`tenure_days`)
+Any ANN-specific preprocessing, such as feature scaling or categorical encoding, will be documented.
 
-The `p99_secs` winsorization threshold (43,573.98 sec/day) is computed once from the training distribution by `build_dataset.py` and logged to MLflow as `feature_config.json`, part of the `dataset_build` run's artifacts (see Key Decision: Dataset Storage below). The serving and monitoring pipelines fetch this frozen value from whichever dataset trained the current production model — never a local file, never recomputed from the serving distribution, which would otherwise silently change the feature scale as listening patterns drift.
+Preprocessing parameters must be fitted using training data only to avoid data leakage.
 
-### Monitoring Strategy
+### 9. Learning Objectives
 
-Three independent tracks in `src/pipelines/monitor.py`, each with its own failure domain:
+The primary learning objective is to become independently comfortable implementing the PyTorch model-development lifecycle.
 
-**Track 1 — Data Drift (daily):** PSI computed for all 20 features against `baseline_features.parquet` — an MLflow artifact from the `dataset_build` run that trained the current production model, fetched fresh each run, never a local file. Bin edges are anchored to the training distribution — never recomputed from serving data. Alert threshold: PSI > 0.2. Log-based features near month-start are expected to alert (structural coverage gap, not model degradation).
+Topics to practise:
 
-**Track 2 — Performance (monthly):** Join month-M predictions with month-M labels on `msno`. Compute AUC-PR, AUC-ROC, Precision@100, Recall@100. Alert threshold: AUC-PR < 0.45 triggers automatic retraining via sub-flow call.
+1. Tensor creation, shapes, data types and operations.
+2. Dataset and DataLoader.
+3. Building neural network architectures using `nn.Module`.
+4. Forward propagation.
+5. Loss functions.
+6. Optimizers and gradient descent.
+7. Training and validation loops.
+8. Model evaluation.
+9. Device management (CPU/GPU).
+10. Model checkpointing and training resumption.
+11. Debugging tensor shapes, gradients, training instability and model behaviour.
 
-**Track 3 — Pipeline health (inline):** Cohort size, null rates, and run status computed and logged by each pipeline at execution time. Alert threshold: cohort_size < 100.
+The experiment will also develop an understanding of when different PyTorch abstractions are appropriate.
 
-All three tracks log to the Prefect run output only — nothing is persisted. `maybe_trigger_retraining` acts on the in-memory perf dict `compute_and_log_performance` returns within that same flow run, not a re-query of any store. A `monitoring_metrics` table used to sit here; it was removed since nothing — no dashboard, no automated trigger, no manual query — ever read it back. Logging what's already computed costs nothing extra; a table nothing queries is dead weight.
+### 10. Experiment Philosophy
 
----
+The goal is not to use a neural network simply because it is more sophisticated.
 
-## Learnings & Trade-offs
+The goal is to understand how to develop neural networks correctly, evaluate their performance, identify their limitations and make informed engineering decisions about when they are appropriate.
 
-**What worked:**
-- The shared feature module (`core/feature_module.py`) eliminated train/serve skew outright — not "monitored for," actually structurally impossible, since there's only one implementation to diverge from.
-- Chaining drift monitoring onto serving (passing the in-memory feature matrix instead of rebuilding it) removed a genuine double-compute with zero new infrastructure.
-- The custom 40-line PSI implementation was faster to get exactly right — anchored bin edges — than configuring Evidently to do the same thing.
-
-**What didn't / what's still missing:**
-- The app itself isn't containerized — Docker Compose runs the infra (Postgres, MLflow), but the pipelines and API still run as bare `python`/`uvicorn` processes on the host. That's inconsistent: if infra is containerized for reproducibility, the app driving it should be too.
-- Prefect pipelines are decorated (`@flow`/`@task`) but not actually deployed on a schedule — "daily serving" and "monthly training" are manual invocations today, not live automation. See the Prefect vs. Airflow trade-off below for why that gap exists.
-- No live deployment. There's no URL to hit directly — reproducing this requires cloning the repo and standing up the stack locally, which is a real gap for anyone trying to evaluate it quickly.
-
-**What I'd do differently:**
-- Containerize the app (pipelines + API) alongside the infra services, so `docker compose up` is the entire reproduction story instead of "start infra, then remember to run five Python commands by hand."
-- Deploy the Score API and a scheduled `serve.py` run to a low-cost host (Railway/Fly.io) so there's a real, live endpoint to hit — even a slow one — instead of asking a reviewer to take the metrics on faith.
-- Stand up an actual Prefect worker/deployment now, since "zero infra for local dev" (see below) was never meant to substitute permanently for real scheduling.
-
-### Key Decision: Feature Consistency Mechanism
-
-**Options considered:**
-
-| Option | Guarantee | Setup time | Operational overhead |
-|---|---|---|---|
-| Feature store (Feast/Tecton) | Strong — enforced at infrastructure level | 2-3 weeks | High — separate service, versioning ceremony |
-| Shared Python module (`core/feature_module.py`) | Enforced by convention — single import | 1 day | Low — just a function |
-| Duplicate code in serve.py and train.py | None — diverges silently | 0 | Zero until it breaks |
-
-**Decision:** Shared module.
-
-**Reasoning:** A feature store solves point-in-time correctness at scale, when dozens of models and pipelines share features and the risk of silent divergence is high. At 35K users/month with a single model and two pipeline files, a shared module enforces the same guarantee with a fraction of the operational overhead. The key design decision is that `feature_cutoff_dt = expire_date - 14 days` is computed *internally* by `build_features()` — the caller passes `expire_date` and never touches the cutoff. That one invariant prevents the most common leakage pattern.
-
-**Outcome:** Zero training-serving skew confirmed. AUC-PR on the held-out test set: 0.979. Verified by running the same `build_features()` call with identical inputs from both training and monitoring pipelines and comparing outputs.
-
-**What I'd do differently at scale:** Add a feature lineage test that runs in CI — serialize the feature vector from training and serving for the same user+date and assert they match byte-for-byte. Right now the invariant is enforced by code structure; at scale it should be enforced by a test.
-
----
-
-### Key Decision: PSI Drift Detection Without Evidently
-
-**Options considered:**
-
-| Option | Flexibility | Dependencies | Interview signal |
-|---|---|---|---|
-| Evidently AI library | High — rich reports | External dependency | "I used a library" |
-| Custom PSI in `core/drift_module.py` | Full control | None beyond numpy/pandas | Shows you understand what PSI is |
-
-**Decision:** Custom PSI.
-
-**Reasoning:** The HLD originally specified Evidently. During implementation, the specific requirement — anchoring bin edges to the training distribution so the baseline never shifts — was easier to implement directly than to configure correctly in Evidently. Total code: 40 lines. The tradeoff is that custom code needs to be maintained; Evidently would handle edge cases in the distribution comparison. At MVP scale with 20 known features, the custom implementation is auditable and fast.
-
----
-
-### Key Decision: Dataset Storage — MLflow Artifacts, Not DVC
-
-**Options considered:**
-
-| Option | Fit for the job | Setup cost | Operational overhead |
-|---|---|---|---|
-| DVC | Purpose-built: content-addressable hashing, dataset diffing, `dvc.yaml` dependency graph | ~Half a day — remote storage config, `.dvc` files | A second tool alongside MLflow, a second remote to manage |
-| MLflow artifacts (what I built) | Repurposed: not designed for datasets — no diffing, no dataset entity, no rollback workflow | Zero — same MLflow server already running | None — rides on the durable volume MLflow already needs |
-
-**Decision:** MLflow artifacts. `pipelines/build_dataset.py` logs `train.parquet` / `val.parquet` / `test.parquet` / `baseline_features.parquet` / `feature_config.json` to a dedicated `dataset_build` MLflow run; the run_id becomes `dataset_version_id`, tagged onto whatever model version the training pipeline fits from it.
-
-**Reasoning:** The actual requirement was narrow — a stable handle that two independent pipelines (training, validation) could agree on, with automatic lineage back to whichever model consumed it. MLflow's artifact store already satisfies that, and it's infrastructure this project needs regardless (model registry, experiment tracking). Standing up DVC would mean a second tool and a second remote for a requirement MLflow already covers at this scale — nothing here uses DVC's actual differentiators (content-hash diffing, checking out an old dataset).
-
-**Tradeoff being accepted:** This is a genuine misuse of MLflow's mental model. MLflow expects a "run" to produce metrics and a model; a `dataset_build` run produces neither — just files. Anyone browsing the MLflow UI sees a run with nothing trained, which is confusing without knowing the pattern.
-
-**What I'd do differently at scale:** Move dataset storage to DVC (or MLflow's own `mlflow.data` dataset-logging API, a smaller step closer to purpose-built) so datasets are versioned by content hash instead of "whatever run happened to log it," and so the `dataset_build` MLflow run doesn't have to double as a dataset registry it was never designed to be.
-
----
-
-### Key Decision: Drift Monitoring Chained Onto Serving, Not Independent
-
-**Options considered:**
-
-| Option | Redundant compute | Independent scheduling | New moving parts |
-|---|---|---|---|
-| Keep fully independent (original design) | Yes — `monitor.py` rebuilds the same day's feature matrix `serve.py` already built | Yes — drift can run on its own schedule | None |
-| Persist a shared artifact (widen `predictions` with feature columns) | No | Yes | A DB migration + a read-or-rebuild fallback branch in `monitor.py` |
-| Chain as a direct subflow call (what I built) | No | No — drift now runs only when serving runs | None — reuses the existing subflow-call pattern `monitor.py` already uses for auto-retraining |
-
-**Decision:** Chain it. `run_serving_pipeline` calls `run_drift_monitoring(current_df=feature_df)` right after writing predictions, passing the feature matrix it already built in memory. `run_drift_monitoring` gained one optional parameter; when it's omitted, the standalone `monitor.py drift --date ...` CLI path is untouched and still rebuilds from source, which is what backfills and post-failure recovery use.
-
-**Reasoning:** Both pipelines were computing the identical `FEATURE_COLS` matrix for the identical cohort on the identical day — a genuine double-compute, not a deliberate independence tradeoff. The shared-artifact option would have fixed that too, but at the cost of a schema change and a permanent dual-path (read vs. rebuild) branch to maintain. The subflow call needed no new infrastructure and mirrors a pattern already established in this codebase (`monitor.py`'s `maybe_trigger_retraining` calling `run_retrain_and_validate_pipeline` the same way) — same tool for the same kind of problem.
-
-**Tradeoff being accepted:** Drift monitoring is no longer independently schedulable in the common case — it only runs when serving runs. If `serve.py` fails before reaching the drift step, that day's drift check doesn't happen automatically; there's no self-healing. Recovery is a manual `monitor.py drift --date <date>` call, the same operator action the 14-day (formerly 13-15) serving window now relies on instead of a rolling retry window.
-
-**What I'd do differently at scale:** Once there's an actual on-call/alerting story — which would need a real metrics sink wired to a pager, not the removed `monitoring_metrics` table, which nothing ever read — reconsider whether losing independent drift scheduling is still the right trade. A system with reliable alerting can afford tighter coupling like this; one without it benefits more from redundant, self-healing pipelines even at extra compute cost.
-
----
-
-### Key Decision: Prefect Over Airflow
-
-**Options considered:**
-
-| Option | Local dev cost | Fit for backfill / date-partitioned runs | Ecosystem & recognizability |
-|---|---|---|---|
-| Airflow | Scheduler + webserver + metadata DB required just to run one DAG | Native — `execution_date`, catchup, and backfill are built-in scheduler concepts | Industry-standard; what most data platform teams run in production |
-| Prefect (what I built) | A plain Python function with `@flow`/`@task` decorators, runnable directly (`python serve.py --date ...`) | Hand-rolled — `scoring_date` param + `--date` CLI flag reimplement a slice of what Airflow gives for free | Smaller ecosystem; the API has changed substantially across major versions (1 → 2 → 3) |
-
-**Decision:** Prefect. Every pipeline (`label.py`, `build_dataset.py`, `train.py`, `validate.py`, `serve.py`, `monitor.py`, `retrain.py`) is a plain Python module decorated with `@flow`/`@task`, runnable directly with no scheduler daemon or metadata DB needed to execute it.
-
-**Reasoning:** For solo local development, not fighting Airflow's DAG-file/metadata-DB coupling just to test one pipeline change was worth more than Airflow's maturity. That said, this is a dev-ergonomics tradeoff, not a clean architectural win — it holds up less cleanly than "zero infra" makes it sound.
-
-**Tradeoff being accepted:**
-- **The infra saving is temporary, not structural.** It applies to local dev only. The moment these pipelines need to actually run on a schedule — the entire point of `serve.py`/`monitor.py` — Prefect needs a server, a worker, and deployment configs running somewhere, the same category of infra Airflow needs. That cost hasn't been paid yet because the pipelines are decorated but not actually scheduled (see "What didn't / what's still missing" above).
-- **Airflow's core idiom is a better fit for what this project reimplements by hand.** `scoring_date` and the `--date` backfill flag are a hand-rolled version of `execution_date`/catchup/backfill — semantics Airflow's scheduler provides natively and has battle-tested for years.
-- **Ecosystem maturity and recognizability.** Airflow is what most data platform teams actually run, and its DAG API has stayed far more stable across major versions than Prefect's (Prefect 1 → 2 → 3 were near-total rewrites). For a project meant to be read by other engineers, that ubiquity carries real legibility value that Prefect's nicer local syntax doesn't offset.
-
-**What I'd do differently at scale:** Once real recurring scheduling with backfill/catchup semantics is actually needed — not just decorated-but-manual pipelines — re-evaluate Airflow specifically for its native `execution_date`/backfill model, which this project currently reimplements by hand. If Prefect stays, the honest next step is standing up its server/worker/deployment configs now, instead of continuing to treat "zero infra" as a permanent property of the choice rather than a deferred one.
-
----
-
-### Key Decision: DuckDB Over Spark for Feature Aggregation
-
-**Options considered:**
-
-| Option | Fit for this data's scale | Setup cost | Operational overhead |
-|---|---|---|---|
-| Spark (PySpark) | Built for data that doesn't fit on one machine — distributed shuffle/partitioning | Cluster or local session, JVM dependency, serialization boundary between JVM and pandas | A cluster (or at minimum a JVM) to run and monitor, even for local dev |
-| DuckDB, embedded in-process (what I built) | Purpose-built for single-machine, columnar, vectorized OLAP on GBs, not TBs | Zero — `pip install duckdb`, `duckdb.connect()` inside the same Python process | None — lives and dies with the Python process; nothing separate to deploy or monitor |
-
-**Decision:** DuckDB, embedded directly inside `core/feature_module.py`. `build_features()` opens an in-process DuckDB connection, points views at either CSVs (`read_csv_auto`) or Postgres (via DuckDB's `postgres` extension/`ATTACH`), and runs three SQL aggregation queries — `_build_txn`, `_build_log`, `_build_member` — that join back into one feature matrix.
-
-**Reasoning:** The KKBox source tables are tens of millions of rows across `transactions`/`user_logs`/`members` — a few GB, comfortably single-machine. Spark's distributed shuffle/partition machinery solves a problem this dataset doesn't have; running it here would mean paying JVM startup and serialization overhead (or standing up a whole cluster) for aggregations DuckDB's vectorized columnar engine does faster in-process, with no serialization boundary between the query engine and pandas, and no separate service to deploy alongside Prefect and Postgres. The aggregation logic itself — window functions, `GROUP BY`, `LEFT JOIN`s — is dbt's philosophy (let SQL do the transform work) without dbt's tooling: it's called as a plain Python function, not compiled and materialized against a warehouse, because there's no warehouse here to model against — just CSVs and one Postgres instance DuckDB can query directly.
-
-**Tradeoff being accepted:** No distributed scale-out path — if the source tables grew past what fits comfortably on one machine's memory/disk, DuckDB's single-node model needs re-architecting, not a config change. No dbt-style model versioning, testing, or lineage graph either; the SQL lives inside Python functions (`_build_txn` etc.), not as tracked, independently-run `.sql` model files.
-
-**What I'd do differently at scale:** If raw event volume grew by 10-100x (billions of rows, multi-TB), move the aggregation to Spark or a warehouse-native transform layer (Snowflake/BigQuery + dbt), and let DuckDB's role shrink back to what it's actually built for — fast local/single-node analytics. At this dataset's actual size, making that move now would add operational cost for a scale problem that doesn't exist yet.
+The existing XGBoost model remains the benchmark against which the ANN will be evaluated.
 
 ---
 
@@ -351,33 +236,3 @@ OpenAPI docs: `http://localhost:8000/docs`
 | Dashboard | URL | Credentials |
 |---|---|---|
 | MLflow experiments | http://localhost:5000 | — |
-
-### Project Layout
-
-```
-src/
-├── config.py               — frozen dataclasses for all pipeline configs
-├── core/                   — pure domain logic (no Prefect, no psycopg2)
-│   ├── feature_module.py   — build_features(), FEATURE_COLS, CAT_COLS
-│   ├── label_module.py     — build_cohort(), compute_labels()
-│   ├── drift_module.py     — compute_feature_drift(), evaluate_cohort_performance()
-│   ├── model_trainer.py    — train_xgb(), split_cohort_3way(), compute_p99_secs()
-│   ├── model_loader.py     — make_model_loader() factory
-│   └── risk_tier.py        — make_tier_strategy() factory
-├── pipelines/              — Prefect @flow + @task, CLI entry points
-│   ├── label.py            — monthly labeling pipeline
-│   ├── build_dataset.py    — labeled cohort → features → train/val/test split → MLflow
-│   ├── train.py            — fit XGBoost on an already-built dataset, register unpromoted
-│   ├── validate.py         — score candidate vs production on held-out test, alias challenger
-│   ├── retrain.py          — thin orchestrator: build_dataset → train → validate
-│   ├── serve.py            — daily scoring pipeline, chains drift monitoring
-│   └── monitor.py          — drift (Track 1) + performance (Track 2) monitoring
-├── experiments/            — one-off baseline scripts (not the production path)
-│   ├── build_training_set.py — cohort selection + label join, writes train_features.parquet
-│   └── train_baseline.py     — train XGBoost baseline
-└── api/                    — FastAPI Score API
-    ├── main.py
-    ├── schemas.py
-    ├── routers/
-    └── repositories/
-```
