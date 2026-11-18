@@ -228,3 +228,7 @@ mlruns/
 # Personal drafts (not for public repo)
 blog_drafts.md
 docs/notes.md
+JD*.md
+
+data/processed/
+pytorch_experiments/preprocessor.joblib
