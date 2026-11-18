@@ -9,7 +9,7 @@ Labels are always derived from transactions: is_churn = 0 if the user has a
 valid (is_cancel=0) transaction within 30 days of their anchor_expiry_date.
 
 Run locally (single execution):
-    python src/label.py --cohort-month 2017-03
+    python src/pipelines/label.py --cohort-month 2017-03
 
 Run via Prefect:
     prefect deployment run kkbox-labeling-pipeline/local --param cohort_month=2017-03
@@ -35,7 +35,8 @@ import psycopg2.extras
 from prefect import flow, get_run_logger, task
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+OUTPUT_DIR = BASE_DIR / "data" / "processed"
+sys.path.insert(0, str(BASE_DIR / "src"))
 
 from config import LabelingConfig, load_labeling_config
 from core.label_module import LABEL_COLS, build_cohort, compute_labels
@@ -253,26 +254,27 @@ def run_labeling_pipeline(
     labels_df = compute_churn_labels(cohort_df=cohort_df, config=config)
 
     # ── Step 3: Write ─────────────────────────────────────────────────────────
-    rows_written = write_labels_postgres(labels_df=labels_df, config=config)
+    # rows_written = write_labels_postgres(labels_df=labels_df, config=config)
 
     # ── Step 4: Health metrics (logged only) ──────────────────────────────────
-    log_labeling_metrics(labels_df=labels_df, rows_written=rows_written)
+    # log_labeling_metrics(labels_df=labels_df, rows_written=rows_written)
 
-    churn_rate = float(labels_df["is_churn"].dropna().mean()) if len(labels_df) > 0 else 0.0
+    # churn_rate = float(labels_df["is_churn"].dropna().mean()) if len(labels_df) > 0 else 0.0
 
-    result = {
-        "cohort_month": cohort_month,
-        "cohort_size": len(cohort_df),
-        "labels_written": rows_written,
-        "churn_rate": round(churn_rate, 4),
-        "status": "success",
-    }
-    logger.info(
-        f"run_labeling_pipeline complete | cohort_month={result['cohort_month']}"
-        f" | cohort_size={result['cohort_size']} | labels_written={result['labels_written']}"
-        f" | churn_rate={result['churn_rate']} | status={result['status']}"
-    )
-    return result
+    # result = {
+    #     "cohort_month": cohort_month,
+    #     "cohort_size": len(cohort_df),
+    #     "labels_written": rows_written,
+    #     "churn_rate": round(churn_rate, 4),
+    #     "status": "success",
+    # }
+    # logger.info(
+    #     f"run_labeling_pipeline complete | cohort_month={result['cohort_month']}"
+    #     f" | cohort_size={result['cohort_size']} | labels_written={result['labels_written']}"
+    #     f" | churn_rate={result['churn_rate']} | status={result['status']}"
+    # )
+    # return result
+    return labels_df
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -300,9 +302,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s — %(message)s")
-    result = run_labeling_pipeline(
+    labels_df = run_labeling_pipeline(
         cohort_month=args.cohort_month,
         data_source=args.data_source,
         data_dir=args.data_dir,
     )
-    print(result)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    output_path = OUTPUT_DIR / "labels.csv"
+    labels_df.to_csv(output_path, index=False)
+
+    print("Pipeline completed successfully.")
+    print("Generated %d rows and %d columns.", *labels_df.shape)
+    print("Labels saved to %s", output_path)

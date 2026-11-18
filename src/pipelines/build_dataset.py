@@ -40,7 +40,8 @@ import psycopg2
 from prefect import flow, get_run_logger, task
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+OUTPUT_DIR = BASE_DIR / "data" / "processed"
+sys.path.insert(0, str(BASE_DIR / "src"))
 
 from config import DatasetBuildConfig, load_dataset_build_config
 from core.feature_module import FEATURE_COLS, build_features, freeze_cat_categories
@@ -78,6 +79,55 @@ def _pg_conn(config: DatasetBuildConfig) -> Generator[psycopg2.extensions.connec
 
 
 # ── Prefect tasks ─────────────────────────────────────────────────────────────
+
+
+@task(
+    name="load-label-cohort-csv",
+    retries=3,
+    retry_delay_seconds=30,
+    tags=["csv", "labels"],
+)
+def load_label_cohort_csv(config: DatasetBuildConfig) -> pd.DataFrame:
+    """
+    Load labels from CSV for training rows.
+
+    If config.cohort_months is non-empty, only those months are loaded;
+    otherwise all available labeled rows are returned.
+
+    Returns DataFrame[msno, anchor_expiry_date, is_churn].
+    """
+    logger = get_run_logger()
+
+    label_path = OUTPUT_DIR / "labels.csv"
+
+    try:
+        df = pd.read_csv(label_path)
+
+        df["anchor_expiry_date"] = pd.to_datetime(
+            df["anchor_expiry_date"], format="%Y-%m-%d"
+        )
+
+        if config.cohort_months:
+            cohort_months = df["anchor_expiry_date"].dt.strftime("%Y-%m")
+            df = df.loc[cohort_months.isin(config.cohort_months)]
+
+        df = (
+            df.loc[:, ["msno", "anchor_expiry_date", "is_churn"]]
+            .sort_values("anchor_expiry_date")
+            .reset_index(drop=True)
+        )
+
+    except Exception as exc:
+        raise LabelLoadError(f"Failed to load labels from CSV: {exc}") from exc
+
+    logger.info(
+        "load_label_cohort_csv complete | rows=%d | cohort_months=%s",
+        len(df),
+        list(config.cohort_months) or "all",
+    )
+
+    return df
+
 
 @task(name="load-label-cohort", retries=3, retry_delay_seconds=30, tags=["db", "labels"])
 def load_label_cohort(config: DatasetBuildConfig) -> pd.DataFrame:
@@ -212,56 +262,57 @@ def split_and_persist_dataset(
         val_fraction=config.val_fraction,
         test_fraction=config.test_fraction,
     )
-    baseline_df = pd.concat([train_df, val_df])[FEATURE_COLS]
+    # baseline_df = pd.concat([train_df, val_df])[FEATURE_COLS]
 
-    mlflow.set_tracking_uri(config.mlflow.tracking_uri)
-    mlflow.set_experiment("kkbox-churn-dataset-build")
+    # mlflow.set_tracking_uri(config.mlflow.tracking_uri)
+    # mlflow.set_experiment("kkbox-churn-dataset-build")
 
-    try:
-        with mlflow.start_run(run_name="dataset_build") as run:
-            mlflow.log_params({
-                "cohort_months": ",".join(config.cohort_months) or "all",
-                "data_source":   config.data_source,
-                "n_train":       len(train_df),
-                "n_val":         len(val_df),
-                "n_test":        len(test_df),
-                "p99_secs":      round(p99_secs, 6),
-            })
-            mlflow.log_metrics({
-                "churn_rate_train": float(train_df["is_churn"].mean()),
-                "churn_rate_val":   float(val_df["is_churn"].mean()),
-                "churn_rate_test":  float(test_df["is_churn"].mean()),
-            })
+    # try:
+    #     with mlflow.start_run(run_name="dataset_build") as run:
+    #         mlflow.log_params({
+    #             "cohort_months": ",".join(config.cohort_months) or "all",
+    #             "data_source":   config.data_source,
+    #             "n_train":       len(train_df),
+    #             "n_val":         len(val_df),
+    #             "n_test":        len(test_df),
+    #             "p99_secs":      round(p99_secs, 6),
+    #         })
+    #         mlflow.log_metrics({
+    #             "churn_rate_train": float(train_df["is_churn"].mean()),
+    #             "churn_rate_val":   float(val_df["is_churn"].mean()),
+    #             "churn_rate_test":  float(test_df["is_churn"].mean()),
+    #         })
 
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmp = Path(tmpdir)
-                train_df.to_parquet(tmp / "train.parquet", index=True)
-                val_df.to_parquet(tmp / "val.parquet", index=True)
-                test_df.to_parquet(tmp / "test.parquet", index=True)
-                baseline_df.to_parquet(tmp / "baseline_features.parquet", index=True)
-                with open(tmp / "feature_config.json", "w") as f:
-                    json.dump(
-                        {"p99_secs": round(p99_secs, 6), "cat_categories": cat_categories},
-                        f, indent=2,
-                    )
+    #         with tempfile.TemporaryDirectory() as tmpdir:
+    #             tmp = Path(tmpdir)
+    #             train_df.to_parquet(tmp / "train.parquet", index=True)
+    #             val_df.to_parquet(tmp / "val.parquet", index=True)
+    #             test_df.to_parquet(tmp / "test.parquet", index=True)
+    #             baseline_df.to_parquet(tmp / "baseline_features.parquet", index=True)
+    #             with open(tmp / "feature_config.json", "w") as f:
+    #                 json.dump(
+    #                     {"p99_secs": round(p99_secs, 6), "cat_categories": cat_categories},
+    #                     f, indent=2,
+    #                 )
 
-                mlflow.log_artifacts(str(tmp), artifact_path="dataset")
+    #             mlflow.log_artifacts(str(tmp), artifact_path="dataset")
 
-            dataset_version_id = run.info.run_id
-    except Exception as exc:
-        raise DatasetRegistrationError(f"Failed to log dataset artifacts: {exc}") from exc
+    #         dataset_version_id = run.info.run_id
+    # except Exception as exc:
+    #     raise DatasetRegistrationError(f"Failed to log dataset artifacts: {exc}") from exc
 
     logger.info(
-        f"split_and_persist_dataset complete | dataset_version_id={dataset_version_id}"
+        f"split_and_persist_dataset complete"
         f" | n_train={len(train_df)} | n_val={len(val_df)} | n_test={len(test_df)}"
     )
-    return {
-        "dataset_version_id": dataset_version_id,
-        "n_train": len(train_df),
-        "n_val": len(val_df),
-        "n_test": len(test_df),
-        "p99_secs": p99_secs,
-    }
+    # return {
+    #     "dataset_version_id": dataset_version_id,
+    #     "n_train": len(train_df),
+    #     "n_val": len(val_df),
+    #     "n_test": len(test_df),
+    #     "p99_secs": p99_secs,
+    # }
+    return train_df, val_df, test_df
 
 
 @task(name="log-dataset-metrics", retries=0, tags=["monitoring"])
@@ -317,7 +368,10 @@ def run_dataset_build_pipeline(
     )
 
     # ── Step 1: Labels ────────────────────────────────────────────────────────
-    cohort_df = load_label_cohort(config=config)
+    if data_source == "csv":
+        cohort_df = load_label_cohort_csv(config=config)
+    elif data_source == "postgres":
+        cohort_df = load_label_cohort(config=config)
 
     if len(cohort_df) == 0:
         logger.warning("Empty label cohort — no rows found. Exiting early.")
@@ -333,22 +387,26 @@ def run_dataset_build_pipeline(
     features_df, p99_secs, cat_categories = build_cohort_features(cohort_df=cohort_df, config=config)
 
     # ── Step 3: Split + persist to MLflow ─────────────────────────────────────
-    dataset_result = split_and_persist_dataset(
+    train_df, val_df, test_df = split_and_persist_dataset(
         features_df=features_df, p99_secs=p99_secs,
         cat_categories=cat_categories, config=config,
     )
+    # dataset_result = split_and_persist_dataset(
+    #     features_df=features_df, p99_secs=p99_secs,
+    #     cat_categories=cat_categories, config=config,
+    # )
 
     # ── Step 4: Health metrics (logged only) ──────────────────────────────────
-    log_dataset_metrics(dataset_result=dataset_result)
+    # log_dataset_metrics(dataset_result=dataset_result)
 
-    result = {"status": "built", **dataset_result}
-    logger.info(
-        f"run_dataset_build_pipeline complete"
-        f" | status={result['status']}"
-        f" | dataset_version_id={result['dataset_version_id']}"
-        f" | n_train={result['n_train']} | n_val={result['n_val']} | n_test={result['n_test']}"
-    )
-    return result
+    # result = {"status": "built", **dataset_result}
+    # logger.info(
+    #     f"run_dataset_build_pipeline complete"
+    #     f" | status={result['status']}"
+    #     f" | dataset_version_id={result['dataset_version_id']}"
+    #     f" | n_train={result['n_train']} | n_val={result['n_val']} | n_test={result['n_test']}"
+    # )
+    return train_df, val_df, test_df
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -380,9 +438,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s — %(message)s")
-    result = run_dataset_build_pipeline(
+    train_df, val_df, test_df = run_dataset_build_pipeline(
         cohort_months=args.cohort_months,
         data_source=args.data_source,
         data_dir=args.data_dir,
     )
-    print(result)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    train_path = OUTPUT_DIR / "train.csv"
+    val_path = OUTPUT_DIR / "val.csv"
+    test_path = OUTPUT_DIR / "test.csv"
+
+    train_df.to_csv(train_path, index=False)
+    val_df.to_csv(val_path, index=False)
+    test_df.to_csv(test_path, index=False)
+
+    print("Pipeline completed successfully!")
