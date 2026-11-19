@@ -41,7 +41,7 @@ class TrainArtifact:
 
     booster: xgb.XGBClassifier
     feature_cols: list[str]    # snapshot of FEATURE_COLS at training time
-    cat_cols: list[str]        # snapshot of CAT_COLS at training time
+    cat_cols: list[str] | None  # snapshot of CAT_COLS at training time
     p99_secs: float            # frozen winsorization threshold — must match serving
     scale_pos_weight: float
     n_train: int
@@ -198,7 +198,8 @@ def train_xgb(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     scale_pos_weight: float,
-    cat_categories: dict[str, list],
+    feature_cols: list[str],
+    cat_categories: dict[str, list] | None = None,
     n_estimators: int = 1000,
     early_stopping_rounds: int = 50,
     p99_secs: float = 0.0,
@@ -219,14 +220,15 @@ def train_xgb(
                         it will see again at serving time.
     p99_secs          : winsorization threshold, stored in the returned artifact.
     """
-    X_train = train_df[FEATURE_COLS].copy()
+    X_train = train_df[feature_cols].copy()
     y_train = train_df["is_churn"]
-    X_val = val_df[FEATURE_COLS].copy()
+    X_val = val_df[feature_cols].copy()
     y_val = val_df["is_churn"]
 
-    for col in CAT_COLS:
-        X_train[col] = pd.Categorical(X_train[col], categories=cat_categories[col])
-        X_val[col] = pd.Categorical(X_val[col], categories=cat_categories[col])
+    if cat_categories is not None:
+        for col, categories in cat_categories.items():
+            X_train[col] = pd.Categorical(X_train[col], categories=categories)
+            X_val[col] = pd.Categorical(X_val[col], categories=categories)
 
     params = _xgb_params(scale_pos_weight, seed)
 
@@ -245,8 +247,8 @@ def train_xgb(
 
     return TrainArtifact(
         booster=model,
-        feature_cols=list(FEATURE_COLS),
-        cat_cols=list(CAT_COLS),
+        feature_cols=list(feature_cols),
+        cat_cols=list(cat_categories) if cat_categories is not None else None,
         p99_secs=p99_secs,
         scale_pos_weight=scale_pos_weight,
         n_train=len(train_df),

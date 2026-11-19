@@ -231,4 +231,4 @@ docs/notes.md
 JD*.md
 
 data/processed/
-pytorch_experiments/preprocessor.joblib
+*.joblib

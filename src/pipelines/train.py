@@ -106,8 +106,11 @@ def train_candidate_model(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     p99_secs: float,
-    cat_categories: dict[str, list],
-    config: TrainingConfig,
+    feature_cols: list[str],
+    cat_categories: dict[str, list] | None = None,
+    # config: TrainingConfig,
+    n_estimators: int = 1000,
+    early_stopping_rounds: int = 50,
 ) -> TrainArtifact:
     """
     Fit XGBoost on train_df, early-stopping against val_df.
@@ -125,9 +128,10 @@ def train_candidate_model(
         artifact = train_xgb(
             train_df, val_df,
             scale_pos_weight=scale_pos,
+            feature_cols=feature_cols,
             cat_categories=cat_categories,
-            n_estimators=config.n_estimators,
-            early_stopping_rounds=config.early_stopping_rounds,
+            n_estimators=n_estimators,
+            early_stopping_rounds=early_stopping_rounds,
             p99_secs=p99_secs,
         )
     except Exception as exc:
